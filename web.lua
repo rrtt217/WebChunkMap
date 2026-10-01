@@ -189,7 +189,12 @@ local function QueryString(P, Extra)
 		"scale=" .. P.scale,
 	}
 	if (P.sel ~= nil) and (P.sel ~= "") then
-		Parts[#Parts + 1] = "sel=" .. P.sel
+		-- ⚠ sel 里的分隔符必须写成 %3B，不能留裸 ';'。
+		-- Cuberite 自己解析裸 ';' 没问题，但中间的代理会把它吃掉：
+		-- Tailscale 的 Go 反向代理按 net/url 的规则处理查询串，裸 ';' 会让**整个参数被丢弃**。
+		-- 实测 https://<tailnet>/…&sel=5:-1;6:-1 -> 服务器收到 sel 为空 -> 页面显示"选中的区块（0）"，
+		-- 而同一个 URL 走 http://<host>:8080 直连完全正常。写成 %3B 后两边都对。
+		Parts[#Parts + 1] = "sel=" .. (P.sel:gsub(";", "%%3B"))
 	end
 	if (Extra ~= nil) then
 		Parts[#Parts + 1] = Extra
