@@ -29,7 +29,8 @@ W.DefaultMode = "topo"
 W.MaxWarmChunks = 512        -- 手动「加载可见区块」单次上限
 W.MaxClickableChunks = 1024  -- 超过这个数量就不生成可点击区域（页面会太大）
 W.InfoTTL = 10               -- 选中区块信息的缓存寿命（秒）
-W.RenderRefresh = 2          -- 等渲染时的自动刷新间隔（秒）
+W.RenderRefresh = 2          -- 等渲染 / 等操作结果时的自动刷新间隔（秒）
+W.InfoRefresh = 1            -- 等区块详情时的自动刷新间隔（秒，不重绘地图）
 
 ----------------------------------------------------------------------
 -- 小工具
@@ -249,7 +250,7 @@ local function SyntheticMeta(Plan, WInfo, WorldName)
 	}
 end
 
-local function BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, InfoStale, RenderQueued)
+local function BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, InfoStale, QueuedRender)
 	local Path = RequestPath(Request)
 	local Base = Path .. "?"
 	local _, SelList = ParseSelection(P.sel)
@@ -399,8 +400,8 @@ local function BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, Inf
 		A("<p>视野太大，已关闭点击选块（把视野调到 32 区块以内即可）。</p>")
 	end
 
-	if RenderQueued and (Png ~= nil) then
-		A("<p>正在后台刷新这张图…</p>")
+	if QueuedRender and (Png ~= nil) then
+		A("<p>缓存已过期，正在后台重绘（当前显示的是上一次的结果，页面不会自动跳转）。</p>")
 	end
 
 	if (Meta.WarmMissing > 0) and (Png ~= nil) then
@@ -605,7 +606,7 @@ function W.HandleRequest(Request, UrlPath)
 	-- 管理操作：只入队，真正执行在 tick 线程
 	--------------------------------------------------------------------
 	local Notice = nil
-	local Queued = false
+	local ActionQueued = false   -- 用户点了操作按钮，页面值得刷新一次
 	local Action = Param(Request, "action")
 
 	if (Action ~= nil) and (Action ~= "") then
@@ -634,7 +635,7 @@ function W.HandleRequest(Request, UrlPath)
 				WCM_Render.Enqueue({ Kind = "regen", WorldName = WorldName, Chunks = Chunks })
 				WCM_Render.FlushCache()
 				Notice = "已把 " .. #Chunks .. " 个区块加入重新生成队列，快照已清除。"
-				Queued = true
+				ActionQueued = true
 			end
 		elseif (Action == "teleport") then
 			local Target = Param(Request, "player") or ""
@@ -644,7 +645,7 @@ function W.HandleRequest(Request, UrlPath)
 				Player = Target, X = First.CX * 16 + 8, Z = First.CZ * 16 + 8,
 			})
 			Notice = "已把传送 " .. Esc(Target) .. " 到区块 (" .. First.CX .. ", " .. First.CZ .. ") 的任务排队。"
-			Queued = true
+			ActionQueued = true
 		elseif (Action == "load") then
 			local Chunks = {}
 			for i, C in ipairs(SelList) do
@@ -660,7 +661,7 @@ function W.HandleRequest(Request, UrlPath)
 				},
 			})
 			Notice = "已排队加载 " .. #Chunks .. " 个区块。"
-			Queued = true
+			ActionQueued = true
 		end
 	end
 
@@ -679,7 +680,7 @@ function W.HandleRequest(Request, UrlPath)
 				MaxChunks = W.MaxWarmChunks,
 			})
 			Notice = "已排队加载视野内未加载的区块（优先从未见过的）。"
-			Queued = true
+			ActionQueued = true
 		end
 	end
 
@@ -699,16 +700,19 @@ function W.HandleRequest(Request, UrlPath)
 			end
 		end
 		if InfoStale then
+			-- 只是把详情面板填上，不重绘地图、也不整页刷新
 			WCM_Render.Enqueue({ Kind = "info", WorldName = WorldName, Chunks = List })
-			Queued = true
 		end
 	end
 
 	--------------------------------------------------------------------
 	-- 图片：命中缓存直接给；否则排一个渲染任务，本次先用占位页
 	--------------------------------------------------------------------
-	local RenderQueued = false
-	if (Png == nil) or (Age > WCM_Render.Config.CacheTTL) or NoCache then
+	-- TTL 只决定"要不要在后台更新缓存"，绝不决定"这次请求能不能用缓存"。
+	-- 命中但过期的图照旧先发出去（stale-while-revalidate）：页面不阻塞、不跳转。
+	local ImageStale = (Png ~= nil) and (Age > WCM_Render.Config.CacheTTL)
+	local QueuedRender = false
+	if (Png == nil) or ImageStale or NoCache then
 		WCM_Render.Enqueue({
 			Kind = "render", WorldName = WorldName,
 			Opts = {
@@ -717,8 +721,7 @@ function W.HandleRequest(Request, UrlPath)
 				NoCache = NoCache,
 			},
 		})
-		Queued = true
-		RenderQueued = true
+		QueuedRender = true
 	end
 
 	if (Meta == nil) then
@@ -746,12 +749,14 @@ function W.HandleRequest(Request, UrlPath)
 		scale = Meta.Scale,
 	}
 
+	-- 只在"用户确实在等新东西"时整页自动刷新：还没有第一张图 / 明确要求重绘 / 点了操作按钮。
+	-- TTL 到期属于后台更新，选中区块属于纯前端行为 —— 两者都不该刷新页面。
 	local RefreshDelay = nil
-	if (Png == nil) then
+	if (Png == nil) or NoCache or ActionQueued then
 		RefreshDelay = W.RenderRefresh
-	elseif Queued then
-		RefreshDelay = W.RenderRefresh
+	elseif InfoStale then
+		RefreshDelay = W.InfoRefresh
 	end
 
-	return BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, InfoStale, RenderQueued), "text/html"
+	return BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, InfoStale, QueuedRender), "text/html"
 end

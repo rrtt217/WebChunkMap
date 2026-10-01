@@ -70,7 +70,7 @@ WebAdmin 需要登录，账号看 `webadmin.ini` 的 `[User:*]` 段。
 | --- | --- | --- |
 | `[Web]` | `TabTitle` | 标签页名称 |
 | | `DefaultSizeChunks` / `DefaultScale` / `DefaultMode` | 打开时的默认视野 |
-| `[Render]` | `CacheTTL` | 图片缓存秒数 |
+| `[Render]` | `CacheTTL` | 缓存的后台刷新阈值（秒）。不影响页面响应；想立刻更新勾「强制重绘」 |
 | | `DrawChunkGrid` / `HillShading` / `DrawPlayers` | 图层元素开关 |
 | `[Cache]` | `RememberChunks` | 是否记住曾经加载过的区块 |
 | | `MaxChunks` | 快照数量上限 |

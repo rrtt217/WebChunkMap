@@ -49,7 +49,7 @@ local function ReadSettings(Folder)
 		DefaultMode   = Ini:GetValueSet("Web", "DefaultMode", "topo"),
 		InlineImages  = Ini:GetValueSetB("Web", "UseInlineImages", true),
 
-		CacheTTL      = Ini:GetValueSetI("Render", "CacheTTL", 30),
+		CacheTTL      = Ini:GetValueSetI("Render", "CacheTTL", 600),
 		MaxCache      = Ini:GetValueSetI("Render", "MaxCacheEntries", 24),
 		MaxPixels     = Ini:GetValueSetI("Render", "MaxPixels", 1000000),
 		MaxSizeChunks = Ini:GetValueSetI("Render", "MaxSizeChunks", 48),
