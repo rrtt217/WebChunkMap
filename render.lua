@@ -1006,6 +1006,16 @@ function R.GetChunkInfo(WorldName, CX, CZ)
 	return ByWorld[ChunkKey(CX, CZ)]
 end
 
+--- 立刻丢弃某个区块的详情缓存。纯 Lua，HTTP 线程可调。
+--- regen / forget 之后要用：详情缓存有 InfoTTL(10s)，不作废的话
+--- 用户点了按钮后 10 秒内看到的还是旧状态，像是"点了没反应"。
+function R.ForgetChunkInfo(WorldName, CX, CZ)
+	local ByWorld = R.ChunkInfo[WorldName]
+	if (ByWorld ~= nil) then
+		ByWorld[ChunkKey(CX, CZ)] = nil
+	end
+end
+
 local function RefreshChunkInfo(World, ChunkList)
 	local WorldName = World:GetName()
 	local ByWorld = R.ChunkInfo[WorldName]
@@ -1135,6 +1145,35 @@ local function RunLoadJob(World, Job)
 	end)
 end
 
+--- 重新生成之后，把这些区块真的加载一次。
+--- 为什么必须做：World:RegenerateChunk() 只是**排队**，区块不被加载就不会真正重生成；
+--- 而快照也只在"已加载"时才会重建（见 Render 里的 IsLoaded 分支）。
+--- 只删不加载的结果是地图上留下一个空白洞（实测：记忆中 DeepOcean Y=61 -> 从未见过）。
+local function LoadAfterRegen(World, WorldName, ChunkList)
+	local List = {}
+	for i, C in ipairs(ChunkList) do
+		List[i] = { C[1], C[2] }
+	end
+	if (#List == 0) then
+		return
+	end
+
+	-- ChunkStay 是异步的，回调在所有区块就绪后于 tick 线程上执行
+	pcall(function ()
+		World:ChunkStay(List, nil, function ()
+			for _, C in ipairs(List) do
+				pcall(function ()
+					local Tile = R.BuildTile(World, C[1], C[2])
+					if (Tile ~= nil) then
+						R.PutTile(WorldName, C[1], C[2], Tile)
+					end
+					RefreshChunkInfo(World, { C })
+				end)
+			end
+		end)
+	end)
+end
+
 --- 处理一个任务；返回是否真的处理了（由 HOOK_WORLD_TICK 调用）。
 function R.RunOneJob(World)
 	local Job = R.Jobs[1]
@@ -1174,6 +1213,8 @@ function R.RunOneJob(World)
 				R.ForgetTile(Job.WorldName, C[1], C[2])
 			end
 			R.FlushCache()
+			-- 只排队不够：不加载就不会真的重生成，快照也重建不了（会留个空白洞）
+			LoadAfterRegen(World, Job.WorldName, Job.Chunks)
 		elseif (Kind == "teleport") then
 			local X, Z = Job.X, Job.Z
 			local Ok2, H = World:TryGetHeight(X, Z)

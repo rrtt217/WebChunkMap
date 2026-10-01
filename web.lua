@@ -285,7 +285,8 @@ local function BuildSelectionPanel(Path, Base, P, WInfo, SelList)
 	A("<button type='submit' name='action' value='load'>加载这些区块</button>")
 	A("<button type='submit' name='action' value='forget'>清除记忆</button>")
 	A("<button type='submit' name='action' value='regen'>重新生成</button>")
-	A("<label><input type='checkbox' name='confirm' value='1'> 我确认重新生成会永久删除这些区块里的所有方块</label>")
+	A("<label><input type='checkbox' name='confirm' value='1'> 我确认重新生成会永久删除这些区块里的所有方块"
+		.. "（未加载的区块会因此被加载一次）</label>")
 	A("</p>")
 	A("<p class='wcm-actions'>")
 	if (#PlayerNames > 0) then
@@ -591,7 +592,7 @@ local function BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, Inf
 		-- 而 fetch() 拒绝带凭据的 URL（TypeError: Request cannot be constructed from a URL
 		-- that includes credentials）。用 location.origin（不含 userinfo）拼绝对地址。
 		-- ⚠ WebAdmin 会把插件标签页的响应**一律**裹进模板页：template.lua 的 ShowPage 无条件
-		-- 拼上 <html><head>…<div class="columns">…，本版本也没有 HOOK_WEBADMIN_REQUEST 可以绕过。
+		-- 拼上 <html><head>…<div class="columns">…，本版本也没有可用于绕过的 WebAdmin 请求钩子。
 		-- 所以 fetch 回来的是**整页 HTML**，直接 innerHTML 就会把整个 WebAdmin 再嵌一层。
 		-- 因此在浏览器侧用 DOMParser 解析这页，只取其中的 #wcm-panel。
 		A("<script>setTimeout(function(){fetch(location.origin + '" .. JsStr(PanelUrl) .. "')"
@@ -670,10 +671,13 @@ function W.HandleRequest(Request, UrlPath)
 					if (i > 64) then break end
 					Chunks[#Chunks + 1] = { C.CX, C.CZ }
 					WCM_Render.ForgetTile(WorldName, C.CX, C.CZ)
+					-- 详情缓存也要立刻作废，否则 10 秒内看到的还是旧状态
+					WCM_Render.ForgetChunkInfo(WorldName, C.CX, C.CZ)
 				end
 				WCM_Render.Enqueue({ Kind = "regen", WorldName = WorldName, Chunks = Chunks })
 				WCM_Render.FlushCache()
-				Notice = "已把 " .. #Chunks .. " 个区块加入重新生成队列，快照已清除。"
+				Notice = "已把 " .. #Chunks .. " 个区块加入重新生成队列。"
+					.. "未加载的区块会被加载一次以完成重生成并重建快照（否则地图上会留下空白洞）。"
 				ActionQueued = true
 			end
 		elseif (Action == "teleport") then
