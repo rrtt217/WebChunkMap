@@ -945,6 +945,10 @@ function R.RefreshWorldCache(World)
 	R.TickCount = R.TickCount + 1
 	local Name = World:GetName()
 	R.KnownWorlds[Name] = true
+	-- DefaultWorldName 由 Initialize 读 cRoot:GetDefaultWorld() 定死。
+	-- 千万不要写成"谁先 tick 谁当默认"—— 那是几个世界的 tick 线程之间的竞态，
+	-- 结果不可预测（本机实测就变成了 world_nether，而 settings.ini 里是 DefaultWorld=world）。
+	-- 下面这个分支只是 Initialize 没取到时的退化兜底。
 	if (R.DefaultWorldName == nil) then
 		R.DefaultWorldName = Name
 	end

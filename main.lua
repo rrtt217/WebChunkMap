@@ -228,6 +228,20 @@ function Initialize(Plugin)
 	WCM_Web.DefaultMode  = Cfg.DefaultMode
 	WCM_Web.InlineImages = Cfg.InlineImages
 
+	-- 默认世界只在这里解析一次。Initialize 不在世界 tick 线程上，读 cRoot 是安全的
+	-- （只是查世界列表，不碰 chunkmap），不能放到 RefreshWorldCache 里按"先到先得"决定。
+	pcall(function ()
+		local Default = cRoot:Get():GetDefaultWorld()
+		if (Default ~= nil) then
+			WCM_Render.DefaultWorldName = Default:GetName()
+		end
+	end)
+	if (WCM_Render.DefaultWorldName ~= nil) then
+		LOG("WebChunkMap: 默认世界 = " .. WCM_Render.DefaultWorldName)
+	else
+		LOG("WebChunkMap: 取不到默认世界，将退化为“第一个 tick 的世界”")
+	end
+
 	WCM_Render.Configure({
 		CacheTTL = Cfg.CacheTTL,
 		MaxCacheEntries = Cfg.MaxCache,
