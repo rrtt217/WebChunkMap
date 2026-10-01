@@ -138,6 +138,16 @@ MaybeSave()                          -- 到点且有改动才把快照落盘
 
 1. **WebAdmin 会把插件标签页的返回内容一律塞进模板 HTML**，不管 `ContentType` 是什么。
    所以图片只能以 `data:image/png;base64,...` 内联进页面，`<img src="...?format=png">` 拿到的是 HTML。
+   **推论：插件标签页永远拿不到"裸响应"。** `webadmin/template.lua` 的 `ShowPage` 无条件拼上
+   `<html><head>…<div class="columns">…`，本版本也没有 `HOOK_WEBADMIN_REQUEST` 可以绕过。
+   所以用 `fetch()` 做局部刷新（例如 `?panel=1`）时返回的**仍是整页 HTML**；
+   直接 `innerHTML = t` 会让整个 WebAdmin 再嵌套一层（页面上出现两个 Cuberite 顶栏、两个 .header）。
+   正确做法是在浏览器侧解析后只取目标容器：
+
+   ```js
+   var d = new DOMParser().parseFromString(t, 'text/html');
+   document.getElementById('wcm-panel').innerHTML = d.getElementById('wcm-panel').innerHTML;
+   ```
 2. **`Request.Path` 是相对路径**（`webadmin/WebChunkMap/map`，没有前导斜杠），
    直接当 `href` / `action` 会被浏览器按当前目录解析成
    `/webadmin/WebChunkMap/webadmin/WebChunkMap/map`。

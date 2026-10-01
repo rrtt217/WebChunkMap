@@ -585,9 +585,17 @@ local function BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, Inf
 		-- http://user:pass@host/... 打开的页面，相对路径会连同 userinfo 一起解析成绝对 URL，
 		-- 而 fetch() 拒绝带凭据的 URL（TypeError: Request cannot be constructed from a URL
 		-- that includes credentials）。用 location.origin（不含 userinfo）拼绝对地址。
+		-- ⚠ WebAdmin 会把插件标签页的响应**一律**裹进模板页：template.lua 的 ShowPage 无条件
+		-- 拼上 <html><head>…<div class="columns">…，本版本也没有 HOOK_WEBADMIN_REQUEST 可以绕过。
+		-- 所以 fetch 回来的是**整页 HTML**，直接 innerHTML 就会把整个 WebAdmin 再嵌一层。
+		-- 因此在浏览器侧用 DOMParser 解析这页，只取其中的 #wcm-panel。
 		A("<script>setTimeout(function(){fetch(location.origin + '" .. JsStr(PanelUrl) .. "')"
 			.. ".then(function(r){return r.text()})"
-			.. ".then(function(t){var e=document.getElementById('wcm-panel');if(e){e.innerHTML=t}})"
+			.. ".then(function(t){"
+			.. "var d=new DOMParser().parseFromString(t,'text/html');"
+			.. "var n=d.getElementById('wcm-panel');"
+			.. "var e=document.getElementById('wcm-panel');"
+			.. "if(n&&e){e.innerHTML=n.innerHTML}})"
 			.. ".catch(function(){});}," .. W.PanelRefresh .. ");</script>")
 	end
 
