@@ -109,8 +109,10 @@ MaybeSave()                          -- 到点且有改动才把快照落盘
 
 - 选中高亮是**纯前端**的（`web.lua` 输出绝对定位的 `<span class="wcm-sel">`），
   `R.PlanKey()` 里**没有** `sel`，所以选区变化永远不该导致重绘。
-- `ActionQueued`（用户点了操作按钮）才值得整页自动刷新；
-  `InfoStale`（详情面板缺数据）用更短的 `W.InfoRefresh` 单独刷新，不重绘地图。
+- 只有 `ActionQueued`（用户点了操作按钮）、`Png == nil`、`NoCache` 才值得**整页**自动刷新。
+- `InfoStale`（详情面板缺数据）走 `?panel=1` + `fetch()` **局部替换 `#wcm-panel`**，
+  既不重绘地图也不重载页面 —— 整页重载会在用户点下一个区块时打乱页面，
+  点击落到已选中的区块上就变成了"取消"，表现为"选第二个区块时全被取消"。
 
 自动补全：`render` 任务结束后，若 `Meta.WarmMissingUnknown > 0` 且到冷却期，就在 tick 线程直接
 `ChunkStay` 排一批（从未见过的优先）。
