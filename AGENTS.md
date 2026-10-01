@@ -89,6 +89,7 @@ MaybeSave()                          -- 到点且有改动才把快照落盘
 | `blocks.lua` | 方块 / 生物群系 -> 颜色表，未知方块有稳定回退色 |
 | `render.lua` | `Plan`（纯几何）+ `PlanKey` + 区域渲染 + 快照缓存与持久化 + 任务队列 + 世界/区块信息缓存 |
 | `web.lua` | WebAdmin 标签页（只读缓存 + 入队），HTML 用 WebAdmin 自带样式 |
+| `settings.ini.example` | 配置模板（进版本库）。`settings.ini` 由 `EnsureSettingsFile()` 在首次启动时复制生成，**被 .gitignore 忽略** |
 
 ---
 
@@ -143,6 +144,8 @@ MaybeSave()                          -- 到点且有改动才把快照落盘
    同时 `web.lua` 会把当前生效值补进选项列表兜底。
 8. **`cStringCompression.CompressStringZLIB` 是静态方法**，点号调用。
 9. 快照文件很大时（几千个区块）落盘会阻塞 tick 线程约 100 ms，所以靠 `SaveInterval` 限流。
+10. **`settings.ini` 不是仓库文件**（只有 `settings.ini.example` 是）。改它不会出现在
+    `git status` 里，别的机器也看不到；要改**默认值**请改 `settings.ini.example` 并推送。
 
 ---
 

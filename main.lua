@@ -1,6 +1,42 @@
 -- main.lua
 -- WebChunkMap 入口：读配置、载入区块快照、注册 WebAdmin 标签页与命令。
 
+--- 确保 settings.ini 存在：没有就从 settings.ini.example 复制一份。
+-- settings.ini 是"每台机器各自的配置"，不进版本库；进库的是 settings.ini.example。
+-- 这样在任何机器上改配置都不会弄脏工作区，也不会和 git pull 打架。
+local function EnsureSettingsFile(Folder)
+	local Path = Folder .. "/settings.ini"
+
+	if (io == nil) or (io.open == nil) then
+		return false
+	end
+
+	local F = io.open(Path, "rb")
+	if (F ~= nil) then
+		F:close()
+		return true
+	end
+
+	local Src = io.open(Folder .. "/settings.ini.example", "rb")
+	if (Src == nil) then
+		LOG("WebChunkMap: 既没有 settings.ini 也没有 settings.ini.example，将全部使用内置默认值")
+		return false
+	end
+	local Data = Src:read("*a")
+	Src:close()
+
+	local Dst = io.open(Path, "wb")
+	if (Dst == nil) then
+		LOG("WebChunkMap: 无法创建 " .. Path .. "，将全部使用内置默认值")
+		return false
+	end
+	Dst:write(Data)
+	Dst:close()
+
+	LOG("WebChunkMap: 已从 settings.ini.example 生成 settings.ini（可自由修改，不会进版本库）")
+	return true
+end
+
 --- 读取 settings.ini（键不存在时用默认值）。
 local function ReadSettings(Folder)
 	local Ini = cIniFile()
@@ -184,6 +220,7 @@ function Initialize(Plugin)
 	Plugin:SetVersion(1)
 
 	local Folder = Plugin:GetLocalFolder()
+	EnsureSettingsFile(Folder)
 	local Cfg = ReadSettings(Folder)
 
 	WCM_Web.DefaultSize  = Cfg.DefaultSize

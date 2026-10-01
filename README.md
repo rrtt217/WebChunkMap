@@ -62,7 +62,9 @@ WebAdmin 需要登录，账号看 `webadmin.ini` 的 `[User:*]` 段。
 
 ## 配置
 
-全部在 [settings.ini](settings.ini)，文件内有逐项注释。最常用的几项：
+首次启动时插件会从 [settings.ini.example](settings.ini.example) 复制出一份 `settings.ini`——
+**这份文件不进版本库**，所以每台机器（本机 / raspi / 别的服务器）都可以随便改，
+既不会弄脏工作区，也不会和 `git pull` 打架。文件内有逐项注释，最常用的几项：
 
 | 段 | 键 | 作用 |
 | --- | --- | --- |
