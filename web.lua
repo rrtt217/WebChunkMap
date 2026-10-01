@@ -29,8 +29,8 @@ W.DefaultMode = "topo"
 W.MaxWarmChunks = 512        -- 手动「加载可见区块」单次上限
 W.MaxClickableChunks = 1024  -- 超过这个数量就不生成可点击区域（页面会太大）
 W.InfoTTL = 10               -- 选中区块信息的缓存寿命（秒）
-W.RenderRefresh = 2          -- 等渲染 / 等操作结果时的自动刷新间隔（秒）
-W.InfoRefresh = 1            -- 等区块详情时的自动刷新间隔（秒，不重绘地图）
+W.RenderRefresh = 2          -- 等渲染 / 等操作结果时的整页自动刷新间隔（秒）
+W.PanelRefresh = 600         -- 详情面板局部 fetch 的延迟（毫秒）
 
 ----------------------------------------------------------------------
 -- 小工具
@@ -200,6 +200,108 @@ end
 ----------------------------------------------------------------------
 -- 页面
 ----------------------------------------------------------------------
+
+--- 选中区块的管理面板。
+--- 单独抽出来是因为 `?panel=1` 只返回这一段：页面用 fetch() 局部替换它，
+--- 从而**不必整页重载**。整页重载会在用户点下一个区块时打乱页面，
+--- 让点击落到已经选中的区块上（触发取消），表现为"选第二个区块时全被取消"。
+local function BuildSelectionPanel(Path, Base, P, WInfo, SelList)
+	local Out = {}
+	local function A(S)
+		Out[#Out + 1] = S
+	end
+
+	A("<h4>选中的区块（" .. #SelList .. "）</h4>")
+	if (#SelList == 0) then
+		A("<p>还没有选中任何区块。点击上面的地图即可选择。</p>")
+		return concat(Out)
+	end
+
+	A("<form method='get' action='" .. Esc(Path) .. "'>")
+	A(Hidden("world", P.world))
+	A(Hidden("mode", P.mode))
+	A(Hidden("cx", P.cx))
+	A(Hidden("cz", P.cz))
+	A(Hidden("size", P.size))
+	A(Hidden("scale", P.scale))
+	A(Hidden("sel", P.sel))
+
+	A("<table>")
+	A("<tr><th>区块</th><th>范围 (X, Z)</th><th>状态</th><th>生物群系</th>"
+		.. "<th>地表 Y</th><th>顶层方块</th><th>实体 / 玩家</th><th>操作</th></tr>")
+
+	for i, C in ipairs(SelList) do
+		if (i > 64) then
+			A("<tr><td colspan='8'>… 其余 " .. (#SelList - 64) .. " 个区块不再列出（一次最多管理 64 个）</td></tr>")
+			break
+		end
+		local Info = WCM_Render.GetChunkInfo(P.world, C.CX, C.CZ)
+		local State = "从未见过"
+		local Biome, Height, Block = "-", "-", "-"
+		local Ent = "…"
+		if (Info ~= nil) then
+			if Info.Loaded then
+				State = "<b style='color:#245A48'>已加载</b>"
+			elseif Info.Remembered then
+				State = "记忆中"
+			end
+			Biome = Info.Biome or "-"
+			Height = (Info.Height ~= nil) and tostring(Info.Height) or "-"
+			Block = Info.BlockName or "-"
+			Ent = tostring(Info.Entities or 0) .. " / " .. tostring(Info.Players or 0)
+		end
+
+		local CenterQ = QueryString({
+			world = P.world, mode = P.mode, sel = P.sel,
+			cx = C.CX * 16 + 8, cz = C.CZ * 16 + 8, size = P.size, scale = P.scale,
+		})
+		local RemoveQ = QueryString({
+			world = P.world, mode = P.mode, sel = ToggleSelection(P.sel, C.CX, C.CZ),
+			cx = P.cx, cz = P.cz, size = P.size, scale = P.scale,
+		})
+		A("<tr>")
+		A("<td>(" .. C.CX .. ", " .. C.CZ .. ")</td>")
+		A("<td>" .. (C.CX * 16) .. ".." .. (C.CX * 16 + 15) .. ", " .. (C.CZ * 16) .. ".." .. (C.CZ * 16 + 15) .. "</td>")
+		A("<td>" .. State .. "</td>")
+		A("<td>" .. Esc(Biome) .. "</td>")
+		A("<td>" .. Esc(Height) .. "</td>")
+		A("<td>" .. Esc(Block) .. "</td>")
+		A("<td>" .. Esc(Ent) .. "</td>")
+		A("<td><a href='" .. Esc(Base .. CenterQ) .. "'>定位</a> · <a href='" .. Esc(Base .. RemoveQ) .. "'>取消选择</a></td>")
+		A("</tr>")
+	end
+	A("</table>")
+
+	local PlayerNames = {}
+	for _, Pl in ipairs(WInfo.Players or {}) do
+		PlayerNames[#PlayerNames + 1] = Pl.Name
+	end
+	A("<p class='wcm-actions'>")
+	A("<button type='submit' name='action' value='load'>加载这些区块</button>")
+	A("<button type='submit' name='action' value='forget'>清除记忆</button>")
+	A("<button type='submit' name='action' value='regen'>重新生成</button>")
+	A("<label><input type='checkbox' name='confirm' value='1'> 我确认重新生成会永久删除这些区块里的所有方块</label>")
+	A("</p>")
+	A("<p class='wcm-actions'>")
+	if (#PlayerNames > 0) then
+		A("把玩家 <select name='player'>" .. OptionList(PlayerNames, "") .. "</select> ")
+		A("<button type='submit' name='action' value='teleport'>传送到第 1 个选中区块</button>")
+	else
+		A("<i>当前没有在线玩家，无法传送。</i>")
+	end
+	A(" <a href='" .. Esc(Base .. QueryString({
+		world = P.world, mode = P.mode, sel = "",
+		cx = P.cx, cz = P.cz, size = P.size, scale = P.scale,
+	})) .. "'>清空选择</a>")
+	A("</p>")
+	A("</form>")
+
+	A("<p>说明：<b>加载这些区块</b> 把它们拉进内存并刷新快照；")
+	A("<b>清除记忆</b> 只删本地快照（不动世界数据）；")
+	A("<b>重新生成</b> 会永久覆盖这些区块，需勾选确认。</p>")
+
+	return concat(Out)
+end
 
 local PAGE_CSS = [[
 <style>
@@ -472,99 +574,23 @@ local function BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, Inf
 	A("</p>")
 
 	------------------------------------------------------------------
-	A("<h4>选中的区块（" .. #SelList .. "）</h4>")
+	-- 面板放在独立容器里：详情刷新只替换这个容器，绝不整页重载
+	-- （整页重载会在用户点下一个区块时打乱页面，点击落到已选中的区块上就变成"取消"）
 	------------------------------------------------------------------
-	if (#SelList == 0) then
-		A("<p>还没有选中任何区块。点击上面的地图即可选择。</p>")
-	else
-		if InfoStale then
-			A("<p>区块详情正在后台刷新…</p>")
-		end
-		A("<form method='get' action='" .. Esc(Path) .. "'>")
-		A(Hidden("world", P.world))
-		A(Hidden("mode", P.mode))
-		A(Hidden("cx", P.cx))
-		A(Hidden("cz", P.cz))
-		A(Hidden("size", P.size))
-		A(Hidden("scale", P.scale))
-		A(Hidden("sel", P.sel))
+	A("<div id='wcm-panel'>" .. BuildSelectionPanel(Path, Base, P, WInfo, SelList) .. "</div>")
 
-		A("<table>")
-		A("<tr><th>区块</th><th>范围 (X, Z)</th><th>状态</th><th>生物群系</th>"
-			.. "<th>地表 Y</th><th>顶层方块</th><th>实体 / 玩家</th><th>操作</th></tr>")
-
-		for i, C in ipairs(SelList) do
-			if (i > 64) then
-				A("<tr><td colspan='8'>… 其余 " .. (#SelList - 64) .. " 个区块不再列出（一次最多管理 64 个）</td></tr>")
-				break
-			end
-			local Info = WCM_Render.GetChunkInfo(P.world, C.CX, C.CZ)
-			local State = "从未见过"
-			local Biome, Height, Block = "-", "-", "-"
-			local Ent
-			if (Info ~= nil) then
-				if Info.Loaded then
-					State = "<b style='color:#245A48'>已加载</b>"
-				elseif Info.Remembered then
-					State = "记忆中"
-				end
-				Biome = Info.Biome or "-"
-				Height = (Info.Height ~= nil) and tostring(Info.Height) or "-"
-				Block = Info.BlockName or "-"
-				Ent = tostring(Info.Entities or 0) .. " / " .. tostring(Info.Players or 0)
-			else
-				Ent = "…"
-			end
-
-			local CenterQ = QueryString({
-				world = P.world, mode = P.mode, sel = P.sel,
-				cx = C.CX * 16 + 8, cz = C.CZ * 16 + 8, size = P.size, scale = P.scale,
-			})
-			local RemoveQ = QueryString({
-				world = P.world, mode = P.mode, sel = ToggleSelection(P.sel, C.CX, C.CZ),
-				cx = P.cx, cz = P.cz, size = P.size, scale = P.scale,
-			})
-			A("<tr>")
-			A("<td>(" .. C.CX .. ", " .. C.CZ .. ")</td>")
-			A("<td>" .. (C.CX * 16) .. ".." .. (C.CX * 16 + 15) .. ", " .. (C.CZ * 16) .. ".." .. (C.CZ * 16 + 15) .. "</td>")
-			A("<td>" .. State .. "</td>")
-			A("<td>" .. Esc(Biome) .. "</td>")
-			A("<td>" .. Esc(Height) .. "</td>")
-			A("<td>" .. Esc(Block) .. "</td>")
-			A("<td>" .. Esc(Ent) .. "</td>")
-			A("<td><a href='" .. Esc(Base .. CenterQ) .. "'>定位</a> · <a href='" .. Esc(Base .. RemoveQ) .. "'>取消选择</a></td>")
-			A("</tr>")
-		end
-		A("</table>")
-
-		local PlayerNames = {}
-		for _, Pl in ipairs(WInfo.Players or {}) do
-			PlayerNames[#PlayerNames + 1] = Pl.Name
-		end
-		A("<p class='wcm-actions'>")
-		A("<button type='submit' name='action' value='load'>加载这些区块</button>")
-		A("<button type='submit' name='action' value='forget'>清除记忆</button>")
-		A("<button type='submit' name='action' value='regen'>重新生成</button>")
-		A("<label><input type='checkbox' name='confirm' value='1'> 我确认重新生成会永久删除这些区块里的所有方块</label>")
-		A("</p>")
-		A("<p class='wcm-actions'>")
-		if (#PlayerNames > 0) then
-			A("把玩家 <select name='player'>" .. OptionList(PlayerNames, "") .. "</select> ")
-			A("<button type='submit' name='action' value='teleport'>传送到第 1 个选中区块</button>")
-		else
-			A("<i>当前没有在线玩家，无法传送。</i>")
-		end
-		A(" <a href='" .. Esc(Base .. QueryString({
-			world = P.world, mode = P.mode, sel = "",
-			cx = P.cx, cz = P.cz, size = P.size, scale = P.scale,
-		})) .. "'>清空选择</a>")
-		A("</p>")
-		A("</form>")
-
-		A("<p>说明：<b>加载这些区块</b> 把它们拉进内存并刷新快照；")
-		A("<b>清除记忆</b> 只删本地快照（不动世界数据）；")
-		A("<b>重新生成</b> 会永久覆盖这些区块，需勾选确认。</p>")
+	if InfoStale then
+		local PanelUrl = Base .. QueryString(P, "panel=1")
+		-- 注意：不能直接把相对路径丢给 fetch()。如果用户是用
+		-- http://user:pass@host/... 打开的页面，相对路径会连同 userinfo 一起解析成绝对 URL，
+		-- 而 fetch() 拒绝带凭据的 URL（TypeError: Request cannot be constructed from a URL
+		-- that includes credentials）。用 location.origin（不含 userinfo）拼绝对地址。
+		A("<script>setTimeout(function(){fetch(location.origin + '" .. JsStr(PanelUrl) .. "')"
+			.. ".then(function(r){return r.text()})"
+			.. ".then(function(t){var e=document.getElementById('wcm-panel');if(e){e.innerHTML=t}})"
+			.. ".catch(function(){});}," .. W.PanelRefresh .. ");</script>")
 	end
+
 
 	return concat(Out)
 end
@@ -751,11 +777,18 @@ function W.HandleRequest(Request, UrlPath)
 
 	-- 只在"用户确实在等新东西"时整页自动刷新：还没有第一张图 / 明确要求重绘 / 点了操作按钮。
 	-- TTL 到期属于后台更新，选中区块属于纯前端行为 —— 两者都不该刷新页面。
+	-- 页面只在"用户确实在等新东西"时整页自动刷新。
+	-- 选中区块的详情走 ?panel=1 局部 fetch，绝不整页重载 ——
+	-- 整页重载会在用户点下一个区块时打乱页面，点击落到已选区块上就变成了"取消"。
 	local RefreshDelay = nil
 	if (Png == nil) or NoCache or ActionQueued then
 		RefreshDelay = W.RenderRefresh
-	elseif InfoStale then
-		RefreshDelay = W.InfoRefresh
+	end
+
+	-- ?panel=1：只回详情面板那一段，供页面用 fetch() 局部替换（不整页重载）
+	if (Param(Request, "panel") == "1") then
+		local PanelPath = RequestPath(Request)
+		return BuildSelectionPanel(PanelPath, PanelPath .. "?", P, WInfo, SelList), "text/html"
 	end
 
 	return BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, InfoStale, QueuedRender), "text/html"
