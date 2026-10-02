@@ -75,6 +75,7 @@ WebAdmin 需要登录，账号看 `webadmin.ini` 的 `[User:*]` 段。
 | | `DrawStructures` | 在地图上标出结构位置（依赖 VanillaFeatureComplement） |
 | `[Cache]` | `RememberChunks` | 是否记住曾经加载过的区块 |
 | | `MaxChunks` | 快照数量上限 |
+| | `MaxLoadedChunks` | **已加载区块总量阀门**（0 = 不限）。小内存机器务必设置，见下 |
 | | `AutoLoadOnView` | 平移时是否自动补全地形 |
 
 ## 命令

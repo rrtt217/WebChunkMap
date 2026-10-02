@@ -224,6 +224,26 @@ end
 -- 页面
 ----------------------------------------------------------------------
 
+--- 在 HTTP 线程上预判"已加载区块总量阀门"。
+--- 这里能安全地知道已加载数：RefreshWorldCache 每个 tick 都把 World:GetNumChunks()
+--- 存进了 R.WorldCache，HTTP 线程只读缓存，不碰 cWorld（铁律一）。
+--- 达到上限就返回一句可以直接显示的提示，否则返回 nil。
+--- （tick 线程那边还有一道真正的闸门：数量随时可能变，这里只是提前告知 + 不做无用功。）
+local function LoadCapNotice(WorldName, What)
+	local Max = WCM_Render.Config.MaxLoadedChunks or 0
+	if (Max <= 0) then
+		return nil
+	end
+	local Info = WCM_Render.GetWorldInfo(WorldName)
+	local Loaded = ((Info ~= nil) and Info.LoadedChunks) or 0
+	if (Loaded < Max) then
+		return nil
+	end
+	return "<b style='color:#a00'>已达加载上限：本世界已加载 " .. Loaded
+		.. " 个区块（上限 " .. Max .. "），" .. (What or "本次不会加载") .. "。</b> "
+		.. "改 <code>settings.ini</code> 的 <code>[Cache] MaxLoadedChunks</code> 可调整（0 = 不限）。"
+end
+
 --- 选中区块的管理面板。
 --- 单独抽出来是因为 `?panel=1` 只返回这一段：页面用 fetch() 局部替换它，
 --- 从而**不必整页重载**。整页重载会在用户点下一个区块时打乱页面，
@@ -729,16 +749,22 @@ function W.HandleRequest(Request, UrlPath)
 				if (i > W.MaxWarmChunks) then break end
 				Chunks[#Chunks + 1] = { C.CX, C.CZ }
 			end
-			WCM_Render.Enqueue({
-				Kind = "load", WorldName = WorldName,
-				Chunks = Chunks,
-				Opts = {
-					Mode = Plan.Mode, SizeChunks = Plan.SizeChunks, Scale = Plan.Scale,
-					CenterX = Plan.CenterX, CenterZ = Plan.CenterZ,
-				},
-			})
-			Notice = "已排队加载 " .. #Chunks .. " 个区块。"
-			ActionQueued = true
+			local Cap = LoadCapNotice(WorldName)
+			if (Cap ~= nil) then
+				-- 已经到顶了就别排了：排了也会在 tick 线程被拒，白白占一个队列位
+				Notice = Cap
+			else
+				WCM_Render.Enqueue({
+					Kind = "load", WorldName = WorldName,
+					Chunks = Chunks,
+					Opts = {
+						Mode = Plan.Mode, SizeChunks = Plan.SizeChunks, Scale = Plan.Scale,
+						CenterX = Plan.CenterX, CenterZ = Plan.CenterZ,
+					},
+				})
+				Notice = "已排队加载 " .. #Chunks .. " 个区块。"
+				ActionQueued = true
+			end
 		end
 	end
 
@@ -747,17 +773,38 @@ function W.HandleRequest(Request, UrlPath)
 	--------------------------------------------------------------------
 	if (Action == nil) or (Action == "") then
 		if (Param(Request, "warm") == "1") and (Meta == nil or Meta.WarmMissing > 0) then
-			WCM_Render.Enqueue({
-				Kind = "load", WorldName = WorldName,
-				Opts = {
-					Mode = Plan.Mode, SizeChunks = Plan.SizeChunks, Scale = Plan.Scale,
-					CenterX = Plan.CenterX, CenterZ = Plan.CenterZ,
-				},
-				IncludeRemembered = true,
-				MaxChunks = W.MaxWarmChunks,
-			})
-			Notice = "已排队加载视野内未加载的区块（优先从未见过的）。"
-			ActionQueued = true
+			local Cap = LoadCapNotice(WorldName, "本次不会自动补全")
+			if (Cap ~= nil) then
+				Notice = Cap
+			else
+				WCM_Render.Enqueue({
+					Kind = "load", WorldName = WorldName,
+					Opts = {
+						Mode = Plan.Mode, SizeChunks = Plan.SizeChunks, Scale = Plan.Scale,
+						CenterX = Plan.CenterX, CenterZ = Plan.CenterZ,
+					},
+					IncludeRemembered = true,
+					MaxChunks = W.MaxWarmChunks,
+				})
+				Notice = "已排队加载视野内未加载的区块（优先从未见过的）。"
+				ActionQueued = true
+			end
+		end
+	end
+
+	--------------------------------------------------------------------
+	-- 被"已加载区块总量阀门"挡下来了？告诉用户一声。
+	-- 否则自动补全/加载按钮点下去毫无反应，比没有这个阀门还让人困惑。
+	-- 只在 15 秒内有效，且不覆盖操作本身给出的提示。
+	--------------------------------------------------------------------
+	if (Notice == nil) and (WCM_Render.Config.MaxLoadedChunks or 0) > 0 then
+		local Refusal = WCM_Render.LastLoadRefusal
+		if (Refusal ~= nil) and (Refusal.WorldName == WorldName)
+			and ((WCM_Render.Now() - Refusal.Time) <= 15) then
+			Notice = "<b style='color:#a00'>已达加载上限：本世界已加载 " .. Refusal.Loaded
+				.. " 个区块（上限 " .. Refusal.Max .. "），本次"
+				.. (Refusal.Explicit and "不会加载" or "不再自动补全") .. "。</b> "
+				.. "改 <code>settings.ini</code> 的 <code>[Cache] MaxLoadedChunks</code> 可调整（0 = 不限）。"
 		end
 	end
 

@@ -30,6 +30,10 @@ R.Config = {
 	RememberTiles = true,     -- 是否记住曾经加载过的区块
 	RememberedShade = 1.0,    -- 记忆中的区块的压暗系数（1.0 = 与实时一致）
 	MaxTiles = 6000,          -- 快照数量上限（每个约 1 KiB 内存 + 磁盘）
+	-- 一个世界里"已加载区块"的总量阀门。0 = 不限。
+	-- 区块是内存大头（实测约 150~200 KB/个，由 Cuberite 的 chunkmap 持有），
+	-- 插件能无限往里灌 —— 小内存机器（树莓派等）必须设一个数，参考：可用内存 MiB ÷ 0.2。
+	MaxLoadedChunks = 0,
 	SaveInterval = 300,       -- 快照落盘间隔（秒）
 	AutoLoadOnView = true,    -- 渲染后自动把“从未见过”的区块排进加载队列
 	AutoLoadMaxChunks = 256,
@@ -1228,6 +1232,42 @@ end
 -- 自动补全的冷却记录：区域键 -> 上次时间
 R.AutoLoadLast = {}
 
+--- 最近一次"因为到了总量上限而拒绝加载"的记录。
+--- tick 线程写、HTTP 线程读，纯 Lua 表（和 R.WorldCache 同性质，不碰 cWorld，安全）。
+--- 页面读它来告诉用户为什么地图补不全 —— 否则按钮点下去没有任何反应。
+R.LastLoadRefusal = nil
+
+local LastRefusalLog = {}    -- [世界名] = 上次写日志的时间，给日志限流
+
+--- 还能再加载多少个区块。没设上限时返回 nil。
+--- World:GetNumChunks() 是**单世界**的，在世界的 tick 线程上调安全（不涉及跨世界锁）。
+local function LoadBudget(World)
+	local Max = R.Config.MaxLoadedChunks
+	if (Max == nil) or (Max <= 0) then
+		return nil
+	end
+	return Max - World:GetNumChunks()
+end
+
+local function RefuseLoad(World, Job, Loaded, Max)
+	local WorldName = World:GetName()
+	R.LastLoadRefusal = {
+		Time = Now(),
+		WorldName = WorldName,
+		Loaded = Loaded,
+		Max = Max,
+		-- 用户明确点的（warm / 加载这些区块）和后台自动补全，提示语气不一样
+		Explicit = (Job.Chunks ~= nil),
+	}
+	local T = Now()
+	if ((T - (LastRefusalLog[WorldName] or -1e9)) >= 60) then
+		LastRefusalLog[WorldName] = T
+		Log(string.format(
+			"%s 已加载 %d 个区块，达到上限 %d，跳过本次加载（日志最多每分钟一条）",
+			WorldName, Loaded, Max))
+	end
+end
+
 local function RunLoadJob(World, Job)
 	local Opts = Job.Opts
 	local Plan = R.Plan(Opts, World:GetSpawnX(), World:GetSpawnZ())
@@ -1261,6 +1301,20 @@ local function RunLoadJob(World, Job)
 
 	if (#ChunkList == 0) then
 		return
+	end
+
+	-- 总量阀门：不整个拒绝，而是按剩余额度截断，上限附近是平滑逼近而不是突然停摆。
+	-- 截断保留队列前部 —— 队列本来就是"从未见过的优先，其次记忆中"，所以留下的是最有价值的。
+	-- （LoadAfterRegen 不走这里：那是用户明确要求的重新生成的后续，挡掉就又变回"地图留白洞"。）
+	local Budget = LoadBudget(World)
+	if (Budget ~= nil) then
+		if (Budget <= 0) then
+			RefuseLoad(World, Job, World:GetNumChunks(), R.Config.MaxLoadedChunks)
+			return
+		end
+		for i = #ChunkList, Budget + 1, -1 do
+			ChunkList[i] = nil
+		end
 	end
 
 	local ChunkStayList = {}
