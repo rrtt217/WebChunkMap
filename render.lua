@@ -30,6 +30,9 @@ R.Config = {
 	RememberTiles = true,     -- 是否记住曾经加载过的区块
 	RememberedShade = 1.0,    -- 记忆中的区块的压暗系数（1.0 = 与实时一致）
 	MaxTiles = 6000,          -- 快照数量上限（每个约 1 KiB 内存 + 磁盘）
+	-- 区块详情缓存的上限。它是内部安全边界，故意不放进 settings.ini：
+	-- 暴露出去只会鼓励别人调大从而失去保护。丢了会自愈（面板显示 … 再排 info 任务补回来）。
+	MaxChunkInfo = 4096,
 	-- 一个世界里"已加载区块"的总量阀门。0 = 不限。
 	-- 区块是内存大头（实测约 150~200 KB/个，由 Cuberite 的 chunkmap 持有），
 	-- 插件能无限往里灌 —— 小内存机器（树莓派等）必须设一个数，参考：可用内存 MiB ÷ 0.2。
@@ -206,6 +209,19 @@ function R.ForgetTile(WorldName, CX, CZ)
 	Tiles[Key] = nil
 	R.TileCount[WorldName] = R.TileCount[WorldName] - 1
 	R.Dirty[WorldName] = true
+
+	-- 必须把键从 FIFO 里摘掉。否则这个键会在 Order 里留下一条"失效条目"，
+	-- 而它指向的键之后可能被重新写入 —— 淘汰时弹出这条失效条目就会把
+	-- **刚写进去的活快照**删掉。（同样的重复键 bug 在 CacheOrder 上也有一份。）
+	-- O(n)，但 forget / regen 都是用户手动、罕见，且单次最多 64 个，可以接受。
+	local Order = R.TileOrder[WorldName]
+	if (Order ~= nil) then
+		for i = #Order, 1, -1 do
+			if (Order[i] == Key) then
+				table.remove(Order, i)
+			end
+		end
+	end
 	return true
 end
 
@@ -517,6 +533,7 @@ end
 ----------------------------------------------------------------------
 
 ----------------------------------------------------------------------
+----------------------------------------------------------------------
 -- 结构位置（跨插件）
 ----------------------------------------------------------------------
 
@@ -533,93 +550,208 @@ local STRUCTURE_COLORS = {
 local STRUCTURE_FALLBACK = { 225, 225, 225 }
 R.StructureColors = STRUCTURE_COLORS    -- 给 web.lua 画图例用
 
---- 目标插件只暴露这三个顶层全局函数（详情见对方 structure_locate.lua 第 8 节）：
----   StructureLocateAPIVersion() -> number
----   StructureLocateKinds()      -> { "Mineshaft", "Village", ... }
----   StructureLocateFind(World, Kind, X, Z, RadiusChunks)
----        -> { Ok = true, Display, X, Y, Z, Distance, Confirmed, ... }
----        -> { Ok = false, Error }   插件在，但这次问不出来
----        -> nil                     插件没装 / 函数名对不上
+--- 目标插件（VanillaFeatureComplement）跨插件 API，当前是 v3：
 ---
---- 注意两点：
----  * 它内部会读世界（Eligibility 要判断区块是否已生成），所以**只能在 tick 线程调用**，
----    不能从 WebAdmin 的 HTTP 线程碰（会锁序反转，见 AGENTS.md 铁律一）。
----  * 查不到就静默跳过。用户要求"失败时不显示错误"，所以既不抛错也不往日志写东西。
-local StructProbe = { Time = -1e9, Kinds = nil }
+---   StructureLocateAPIVersion() -> 3
+---   StructureLocateKinds()      -> { "Mineshaft", "Village", ... }
+---   StructureLocateFindAll(World, Kind, MinX, MinZ, MaxX, MaxZ, RefX, RefZ, Biomes)
+---        -> { Ok = true, Count, ConfirmedCount, Items = { {Kind, Display, X, Y, Z,
+---             Distance, Confirmed, Detail, OriginX, OriginZ}, ... } }
+---        -> { Ok = false, Error, ApiVersion }   插件在，但这次问不出来
+---        -> nil                                  插件没装 / 函数名对不上
+---
+---   Biomes 是可选表 {["blockX,blockZ"] = biomeId}，**只在引擎答不出来时**（区块没加载）
+---   才被使用；引擎自己的答案永远优先，所以给错了也只是被忽略，不会被当真。
+---
+--- 三条硬约束：
+---  * 只能在 tick 线程调用（对方内部要读世界判断区块是否已生成）。所以它在 R.Render
+---    里，不在 web.lua 里 —— 从 WebAdmin 的 HTTP 线程调会锁序反转（铁律一）。
+---  * 失败一律静默。整段包 pcall，Ok=false / nil / 抛错都当作"没有结构"。
+---  * 跨插件的表是**拷贝**的，所以 Biomes 绝不能铺满视野（见下面 SupplyBiomes 的注释）。
+local STRUCTURE_API_VERSION = 3
 
---- 问一次对方支持哪些结构；最多每 60 秒探一次，失败也不吵。
-local function StructKinds()
+local StructProbe = { Time = -1e9, Api = nil }
+
+--- 探测一次对方可用性，最多每 60 秒一次；不可用就返回 nil。
+--- 限流是为了别让对方每次都往日志里写 "Function '<name>' not found"。
+local function StructApi()
 	local T = Now()
 	if ((T - StructProbe.Time) < 60) then
-		return StructProbe.Kinds
+		return StructProbe.Api
 	end
 	StructProbe.Time = T
+	StructProbe.Api = nil
+
+	local Version = nil
+	pcall(function ()
+		Version = cPluginManager:CallPlugin("VanillaFeatureComplement", "StructureLocateAPIVersion")
+	end)
+	if (type(Version) ~= "number") or (Version < STRUCTURE_API_VERSION) then
+		return nil
+	end
 	local Kinds = nil
 	pcall(function ()
 		Kinds = cPluginManager:CallPlugin("VanillaFeatureComplement", "StructureLocateKinds")
 	end)
-	if (type(Kinds) == "table") and (#Kinds > 0) then
-		StructProbe.Kinds = Kinds
-	else
-		StructProbe.Kinds = nil
+	if (type(Kinds) ~= "table") or (#Kinds == 0) then
+		return nil
 	end
-	return StructProbe.Kinds
+	StructProbe.Api = { Version = Version, Kinds = Kinds }
+	return StructProbe.Api
 end
 
---- 收集视野内的结构位置。返回 标记表, 结构列表（都可能是 nil）。
-local function CollectStructures(World, OriginX, OriginZ, Blocks, SizeChunks)
-	local Kinds = StructKinds()
-	if (Kinds == nil) then
-		return nil, nil
+--- 从我们自己的区块快照里取某个方块的群系；没有快照或快照里没记就返回 nil。
+--- 编号与引擎一致（快照里存的就是 World:GetBiomeAt() 的值 + 1）。
+local function SnapshotBiome(WorldName, X, Z)
+	local CX, CZ = floor(X / 16), floor(Z / 16)
+	local Tile = R.GetTile(WorldName, CX, CZ)
+	if (Tile == nil) then
+		return nil
+	end
+	local B = R.TileBiomeAt(Tile, (Z - CZ * 16) * 16 + (X - CX * 16))
+	if (B == nil) or (B < 0) then
+		return nil
+	end
+	return B
+end
+
+-- 一次塞给对方的群系条目上限（防呆）。实际上只有几十到几百条，见下面注释。
+local SUPPLY_BIOME_MAX = 2048
+
+--- 给"对方判为不确定"的结构补上我们知道的群系。
+---
+--- 为什么要分两趟：Biomes 是跨插件拷贝的表，铺满视野代价不可接受
+--- （size=16 的视野是 256x256 = 65536 个方块，乘 7 种结构、每方块还要新建一个键字符串）。
+--- 而对方真正会去问的坐标其实只有：
+---   * 每个候选的**原点方块**（Kind.Biome == "origin" 的那一类）
+---   * 村庄还要问原点区块的**全部 256 列**（它要拿整块地的群系去判 pool 的 AllowedBiomes）
+--- 所以第一趟不带群系先跑，把"不确定"的原点收上来，第二趟只补这些坐标 ——
+--- 表通常只有几十项，村庄也就几百项。
+local function SupplyBiomes(WorldName, Kind, Items)
+	local Need = {}
+	local Count = 0
+
+	local function Want(X, Z)
+		local Key = X .. "," .. Z
+		if (Need[Key] == nil) and (Count < SUPPLY_BIOME_MAX) then
+			Need[Key] = true
+			Count = Count + 1
+		end
 	end
 
-	-- 搜索窗口只要刚好盖住视野即可；窗口越大对方扫的网格单元越多。
-	local Window = math.max(1, math.ceil(SizeChunks / 2))
-	local QueryX = OriginX + floor(Blocks / 2)
-	local QueryZ = OriginZ + floor(Blocks / 2)
-
-	local Markers = {}
-	local Found = {}
-	local function Plot(BlockX, BlockZ, Cr, Cg, Cb, Radius)
-		local BaseBX = floor(BlockX) - OriginX
-		local BaseBZ = floor(BlockZ) - OriginZ
-		for dx = -Radius, Radius do
-			for dz = -Radius, Radius do
-				local bx, bz = BaseBX + dx, BaseBZ + dz
-				if (bx >= 0) and (bx < Blocks) and (bz >= 0) and (bz < Blocks) then
-					Markers[bx * 4096 + bz] = { Cr, Cg, Cb }
+	for _, It in ipairs(Items) do
+		if (It.Confirmed ~= true) and (type(It.OriginX) == "number") and (type(It.OriginZ) == "number") then
+			Want(It.OriginX, It.OriginZ)
+			if (Kind == "Village") then
+				local CX, CZ = floor(It.OriginX / 16), floor(It.OriginZ / 16)
+				for tz = 0, 15 do
+					for tx = 0, 15 do
+						Want(CX * 16 + tx, CZ * 16 + tz)
+					end
 				end
 			end
 		end
 	end
 
-	for _, Kind in ipairs(Kinds) do
+	if (Count == 0) then
+		return nil
+	end
+
+	local Table_ = {}
+	local Filled = 0
+	for Key in pairs(Need) do
+		local X, Z = Key:match("^(-?%d+),(-?%d+)$")
+		if (X ~= nil) then
+			local B = SnapshotBiome(WorldName, tonumber(X), tonumber(Z))
+			if (B ~= nil) then
+				Table_[Key] = B
+				Filled = Filled + 1
+			end
+		end
+	end
+
+	-- 一条都对不上就别多跑一趟了
+	if (Filled == 0) then
+		return nil
+	end
+	return Table_
+end
+
+--- 收集视野内的结构位置。返回 标记表, 结构列表（都可能是 nil）。
+local function CollectStructures(World, WorldName, OriginX, OriginZ, Blocks)
+	local Api = StructApi()
+	if (Api == nil) then
+		return nil, nil
+	end
+
+	-- 直接问"视野这个矩形里有哪些"，而不是"离中心最近的一个"：
+	-- v3 的 FindAll 会把矩形内**所有**该种结构按距离排好返回，
+	-- 所以一个视野里有俩村庄时两个都会画出来。
+	local MinX, MinZ = OriginX, OriginZ
+	local MaxX, MaxZ = OriginX + Blocks - 1, OriginZ + Blocks - 1
+	local RefX, RefZ = OriginX + floor(Blocks / 2), OriginZ + floor(Blocks / 2)
+
+	local function FindAll(Kind, Biomes)
 		local Res = nil
 		pcall(function ()
-			Res = cPluginManager:CallPlugin("VanillaFeatureComplement", "StructureLocateFind",
-				World, Kind, QueryX, QueryZ, Window)
+			Res = cPluginManager:CallPlugin("VanillaFeatureComplement", "StructureLocateFindAll",
+				World, Kind, MinX, MinZ, MaxX, MaxZ, RefX, RefZ, Biomes)
 		end)
-		if (type(Res) == "table") and (Res.Ok == true)
-			and (type(Res.X) == "number") and (type(Res.Z) == "number") then
-			local bx = floor(Res.X) - OriginX
-			local bz = floor(Res.Z) - OriginZ
-			if (bx >= 0) and (bx < Blocks) and (bz >= 0) and (bz < Blocks) then
-				local C = STRUCTURE_COLORS[Kind] or STRUCTURE_FALLBACK
-				-- 未确认的（对方只敢猜的）画成空心：先铺底色再挖中心
-				if (Res.Confirmed == true) then
-					Plot(Res.X, Res.Z, C[1], C[2], C[3], 2)
-					Plot(Res.X, Res.Z, 255, 255, 255, 0)
-				else
-					Plot(Res.X, Res.Z, C[1], C[2], C[3], 2)
-					Plot(Res.X, Res.Z, 0, 0, 0, 1)
+		if (type(Res) == "table") and (Res.Ok == true) and (type(Res.Items) == "table") then
+			return Res.Items
+		end
+		return nil
+	end
+
+	local Markers = {}
+	local Found = {}
+
+	for _, Kind in ipairs(Api.Kinds) do
+		local Items = FindAll(Kind, nil)
+		if (Items ~= nil) and (#Items > 0) then
+			-- 第二趟：把"引擎答不出来"的坐标用我们自己的快照补上
+			local Biomes = SupplyBiomes(WorldName, Kind, Items)
+			if (Biomes ~= nil) then
+				local Better = FindAll(Kind, Biomes)
+				if (Better ~= nil) then
+					Items = Better
 				end
-				Found[#Found + 1] = {
-					Kind = Kind,
-					Display = Res.Display or Kind,
-					X = Res.X, Y = Res.Y, Z = Res.Z,
-					Confirmed = (Res.Confirmed == true),
-					Distance = Res.Distance,
-				}
+			end
+
+			local C = STRUCTURE_COLORS[Kind] or STRUCTURE_FALLBACK
+			for _, It in ipairs(Items) do
+				if (type(It.X) == "number") and (type(It.Z) == "number") then
+					local bx = floor(It.X) - OriginX
+					local bz = floor(It.Z) - OriginZ
+					if (bx >= 0) and (bx < Blocks) and (bz >= 0) and (bz < Blocks) then
+						local Confirmed = (It.Confirmed == true)
+						-- 确认过的：实心 + 白心；只敢猜的：实心 + 黑心（一眼能区分）
+						for dx = -2, 2 do
+							for dz = -2, 2 do
+								local px, pz = bx + dx, bz + dz
+								if (px >= 0) and (px < Blocks) and (pz >= 0) and (pz < Blocks) then
+									Markers[px * 4096 + pz] = { C[1], C[2], C[3] }
+								end
+							end
+						end
+						local Center = Confirmed and { 255, 255, 255 } or { 0, 0, 0 }
+						for dx = -1, 1 do
+							for dz = -1, 1 do
+								local px, pz = bx + dx, bz + dz
+								if (px >= 0) and (px < Blocks) and (pz >= 0) and (pz < Blocks) then
+									Markers[px * 4096 + pz] = Center
+								end
+							end
+						end
+						Found[#Found + 1] = {
+							Kind = Kind,
+							Display = It.Display or Kind,
+							X = It.X, Y = It.Y, Z = It.Z,
+							Confirmed = Confirmed,
+							Distance = It.Distance,
+						}
+					end
+				end
 			end
 		end
 	end
@@ -794,10 +926,20 @@ function R.Render(World, Opts)
 	end
 
 	-- 结构位置（跨插件）。整段包 pcall：对方插件没装、函数改名、内部报错，
-	-- 一律当作"没有结构"处理，不往页面和日志里冒错误。
+	-- 一律当作"没有结构"处理，页面上永远不冒错误。
 	local StructMarkers, Structures = nil, nil
 	if Cfg.DrawStructures then
-		local OkS, M, L = pcall(CollectStructures, World, OriginX, OriginZ, Blocks, SizeChunks)
+		local OkS, M, L = pcall(CollectStructures, World, WorldName, OriginX, OriginZ, Blocks)
+		if (not OkS) then
+			-- 这是"我们自己内部出错"，和"对方插件没装"那种正常失败不同：
+			-- 页面依旧什么都不显示，但控制台每分钟最多记一条。
+			-- （曾经全静默，一个真 bug 查了半天才找到，所以留这个窄口子。）
+			local TErr = Now()
+			if ((TErr - (R.LastStructError or -1e9)) >= 60) then
+				R.LastStructError = TErr
+				LOG("结构采集内部出错（每分钟最多一条）: " .. tostring(M))
+			end
+		end
 		if OkS then
 			StructMarkers, Structures = M, L
 		end
@@ -950,14 +1092,20 @@ function R.Render(World, Opts)
 	R.Stats.LastRenderMs = Meta.RenderMs
 
 	R.Cache[Key] = { Time = Time, Png = Png, Meta = Meta }
-	R.CacheOrder[#R.CacheOrder + 1] = Key
-	while (#R.CacheOrder > Cfg.MaxCacheEntries) do
-		local Old = table.remove(R.CacheOrder, 1)
-		if (Old ~= Key) then
-			R.Cache[Old] = nil
-		else
-			R.CacheOrder[#R.CacheOrder + 1] = Old
+
+	-- 同一个视图重绘时 Key 会第二次入队，必须先摘掉旧的那条。
+	-- 否则淘汰弹出旧条目时 R.Cache[Old] = nil 会把**当前还有效的缓存图**删掉
+	--（原来那句 `if Old ~= Key` 只保护了本次刚插入的那个，保护不了旧重复项），
+	-- 结果是"经常看的视图反而被提前淘汰" -> 重绘变多 -> tick 线程更累。
+	for i = #R.CacheOrder, 1, -1 do
+		if (R.CacheOrder[i] == Key) then
+			table.remove(R.CacheOrder, i)
 		end
+	end
+	R.CacheOrder[#R.CacheOrder + 1] = Key
+
+	while (#R.CacheOrder > Cfg.MaxCacheEntries) do
+		R.Cache[table.remove(R.CacheOrder, 1)] = nil
 	end
 
 	return Png, Meta
@@ -1138,6 +1286,7 @@ end
 ----------------------------------------------------------------------
 
 R.ChunkInfo = {}
+R.ChunkInfoOrder = {}     -- [世界名] = { chunkKey, ... }，FIFO 淘汰用（见 ForgetChunkInfo 的注释）
 
 function R.GetChunkInfo(WorldName, CX, CZ)
 	local ByWorld = R.ChunkInfo[WorldName]
@@ -1152,8 +1301,23 @@ end
 --- 用户点了按钮后 10 秒内看到的还是旧状态，像是"点了没反应"。
 function R.ForgetChunkInfo(WorldName, CX, CZ)
 	local ByWorld = R.ChunkInfo[WorldName]
-	if (ByWorld ~= nil) then
-		ByWorld[ChunkKey(CX, CZ)] = nil
+	if (ByWorld == nil) then
+		return
+	end
+	local Key = ChunkKey(CX, CZ)
+	if (ByWorld[Key] == nil) then
+		return
+	end
+	ByWorld[Key] = nil
+	-- 和 ForgetTile 同一个道理：不从 FIFO 里摘掉的话，这条失效条目之后
+	-- 会在同一个键被重新写入时把活条目淘汰掉。
+	local Order = R.ChunkInfoOrder[WorldName]
+	if (Order ~= nil) then
+		for i = #Order, 1, -1 do
+			if (Order[i] == Key) then
+				table.remove(Order, i)
+			end
+		end
 	end
 end
 
@@ -1221,7 +1385,24 @@ local function RefreshChunkInfo(World, ChunkList)
 			end)
 		end
 
-		ByWorld[ChunkKey(CX, CZ)] = Info
+		-- 详情缓存是唯一真正"无界"的表：只有 ForgetChunkInfo 会删它。
+		-- 每天浏览下来会攒到几万条（每条约 250-300 B）。这里做 FIFO 封顶。
+		-- 丢了会自愈：面板显示 … -> InfoStale -> 排一个 info 任务补回来。
+		local Key = ChunkKey(CX, CZ)
+		if (ByWorld[Key] == nil) then
+			local Order = R.ChunkInfoOrder[WorldName]
+			if (Order == nil) then
+				Order = {}
+				R.ChunkInfoOrder[WorldName] = Order
+			end
+			Order[#Order + 1] = Key
+			local Max = R.Config.MaxChunkInfo or 4096
+			while (#Order > Max) do
+				local Old = table.remove(Order, 1)
+				ByWorld[Old] = nil
+			end
+		end
+		ByWorld[Key] = Info
 	end
 end
 
@@ -1231,6 +1412,18 @@ end
 
 -- 自动补全的冷却记录：区域键 -> 上次时间
 R.AutoLoadLast = {}
+R.AutoLoadInserted = 0    -- 距上次清扫新增了多少条（摊还清扫用）
+
+--- R.AutoLoadLast 每访问一个新区域就多一条，从不清。
+--- 但不能每 tick 全表扫（20/s × 世界数），所以攒够 256 条才扫一次：O(1) 摊还。
+local function PruneAutoLoadLast(T)
+	local Keep = (R.Config.AutoLoadCooldown or 60) * 4
+	for Key, Stamp in pairs(R.AutoLoadLast) do
+		if ((T - Stamp) >= Keep) then
+			R.AutoLoadLast[Key] = nil
+		end
+	end
+end
 
 --- 最近一次"因为到了总量上限而拒绝加载"的记录。
 --- tick 线程写、HTTP 线程读，纯 Lua 表（和 R.WorldCache 同性质，不碰 cWorld，安全）。
@@ -1365,6 +1558,49 @@ local function LoadAfterRegen(World, WorldName, ChunkList)
 	end)
 end
 
+--- 跨插件调试出口：把插件自己持有的几个表的大小报出来。
+---
+--- 为什么需要它：插件的 Lua 堆**没法从外面量** —— 没有对应的 API，而 execute_lua
+--- 跑在 MCPServer 的 Lua 状态里，CallPlugin 也只能调对方导出的函数。
+--- 所以"哪些表在涨"只能靠读代码推算；有了这个出口就能直接看数。
+---
+-- luacheck: ignore WebChunkMap_MemStats
+--- 用法：cPluginManager:CallPlugin("WebChunkMap", "WebChunkMap_MemStats")
+--- 返回值只能是简单表/数字/字符串（跨插件不能传函数）。
+function WebChunkMap_MemStats()
+	local function Count(T)
+		local n = 0
+		for _ in pairs(T) do n = n + 1 end
+		return n
+	end
+	local Sum = function (PerWorld, UseLen)
+		local n = 0
+		for _, V in pairs(PerWorld) do
+			n = n + (UseLen and #V or Count(V))
+		end
+		return n
+	end
+
+	local LuaKiB = -1
+	pcall(function ()
+		LuaKiB = floor(collectgarbage("count") or 0)
+	end)
+
+	return {
+		LuaKiB         = LuaKiB,                       -- 本插件 Lua 状态占用的 KiB
+		Tiles          = R.TileStats(nil),
+		TileOrder      = Sum(R.TileOrder, true),
+		ChunkInfo      = Sum(R.ChunkInfo, false),
+		ChunkInfoOrder = Sum(R.ChunkInfoOrder, true),
+		CacheEntries   = Count(R.Cache),
+		CacheOrder     = #R.CacheOrder,
+		AutoLoadLast   = Count(R.AutoLoadLast),
+		Jobs           = #R.Jobs,
+		MaxTiles       = R.Config.MaxTiles,
+		MaxChunkInfo   = R.Config.MaxChunkInfo,
+	}
+end
+
 --- 处理一个任务；返回是否真的处理了（由 HOOK_WORLD_TICK 调用）。
 function R.RunOneJob(World)
 	local Job = R.Jobs[1]
@@ -1386,6 +1622,13 @@ function R.RunOneJob(World)
 				local T = Now()
 				local Last = R.AutoLoadLast[RegionKey]
 				if (Last == nil) or ((T - Last) >= R.Config.AutoLoadCooldown) then
+					if (Last == nil) then
+						R.AutoLoadInserted = R.AutoLoadInserted + 1
+						if (R.AutoLoadInserted >= 256) then
+							R.AutoLoadInserted = 0
+							PruneAutoLoadLast(T)
+						end
+					end
 					R.AutoLoadLast[RegionKey] = T
 					RunLoadJob(World, {
 						Opts = Job.Opts,

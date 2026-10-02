@@ -177,8 +177,10 @@ function HandleChunkMapConsole(Split, EntireCommand)
 	LOG("  地址        " .. GetMapURL())
 	LOG("  默认        " .. WCM_Web.DefaultMode .. "，视野 " .. WCM_Web.DefaultSize .. " 区块，缩放 "
 		.. WCM_Web.DefaultScale .. "x，内联图片 " .. tostring(WCM_Web.InlineImages))
-	LOG("  区块快照    " .. WCM_Render.TileStats(nil) .. " 个 / 上限 " .. WCM_Render.Config.MaxTiles
-		.. (WCM_Render.IsDirty() and "（有未落盘的改动）" or "（已落盘）"))
+	-- 上限是**按世界**算的（PutTile 只淘汰本世界的快照），所以这里先给总数、
+	-- 再说清"每世界上限"，免得总数 6072 对上限 6000 看着像超了（其实 world 5992 并没超）。
+	LOG("  区块快照    共 " .. WCM_Render.TileStats(nil) .. " 个，每世界上限 " .. WCM_Render.Config.MaxTiles
+		.. "（各世界用量见下）" .. (WCM_Render.IsDirty() and "（有未落盘的改动）" or "（已落盘）"))
 	for WorldName, Count in pairs(WCM_Render.TileCount) do
 		local MinCX, MaxCX, MinCZ, MaxCZ = nil, nil, nil, nil
 		if (WCM_Render.Tiles[WorldName] ~= nil) then

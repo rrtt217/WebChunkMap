@@ -138,26 +138,41 @@ MaybeSave()                          -- 到点且有改动才把快照落盘
 
 ### 结构位置（唯一的跨插件调用）
 
-地图上的结构标记来自 **VanillaFeatureComplement** 的 Locate API，走
+地图上的结构标记来自 **VanillaFeatureComplement** 的 Locate API（**v3**），走
 `cPluginManager:CallPlugin("VanillaFeatureComplement", …)`：
 
 | 函数 | 说明 |
 | --- | --- |
-| `StructureLocateAPIVersion()` | 返回 1；用来判断对方在不在 |
+| `StructureLocateAPIVersion()` | 返回 3；低于 `STRUCTURE_API_VERSION` 就整个不启用 |
 | `StructureLocateKinds()` | 7 种结构名 |
-| `StructureLocateFind(World, Kind, X, Z, RadiusChunks)` | `{Ok=true, Display, X, Z, Confirmed, …}` / `{Ok=false, Error}` / **nil**（插件没装或函数名不对） |
+| `StructureLocateFindAll(World, Kind, MinX, MinZ, MaxX, MaxZ, RefX, RefZ, Biomes)` | `{Ok=true, Count, ConfirmedCount, Items={{Kind,Display,X,Y,Z,Distance,Confirmed,Detail,OriginX,OriginZ},…}}` / `{Ok=false, Error}` / **nil**（插件没装或函数名不对） |
 
-三条硬约束：
+**v1 的 `StructureLocateFind` 已经不存在了**（对方改成 `FindNearest` / `FindAll`，并加了 `Biomes`）。
+我们只用 `FindAll`：它按矩形返回**该种结构的全部实例**（按距离排序），
+所以一个视野里有俩村庄时两个都会画出来；旧写法一圈只能画最近的一个。
+
+**`Biomes` 是我们这侧的独门数据**：`{["blockX,blockZ"] = biomeId}`，对方**只在引擎答不出来时**
+（区块没加载）才用，引擎自己的答案永远优先 —— 给错了也只会被忽略，不会被当真。
+我们每个区块快照里都存了 16x16 的群系，正好补这个洞。
+
+四条硬约束：
 
 1. **只能在 tick 线程调用**。对方内部要读世界（判断区块是否已生成），从 WebAdmin 的
    HTTP 线程调就会锁序反转 —— 所以它放在 `R.Render` 里，不在 `web.lua` 里。
-2. **失败一律静默**。整段包 `pcall`，`Ok=false` / nil / 抛错都当作"没有结构"，
-   既不写日志也不在页面上冒错误（用户明确要求）。查询次数本身也限流：
-   `StructKinds()` 最多每 60 秒探一次，免得对方每次渲染都往日志写 "Function not found"。
-3. **搜索窗口只盖住视野**（`ceil(SizeChunks/2)` 个区块），别用对方默认的 100 ——
-   窗口越大它扫的网格单元越多。实测 7 种结构查一遍约 42 ms。
+2. **失败一律静默**（页面层面）。`Ok=false` / nil / 抛错都当作"没有结构"，页面上不冒错误。
+   查询次数限流：`StructApi()` 最多每 60 秒探一次，免得对方每次渲染都往日志写 "Function not found"。
+   **例外**：*我们自己内部*抛异常时每分钟记一条控制台日志 —— 全静默会让 bug 也查不出来
+   （这条是踩过才加的：一个真 bug 因为被 pcall 吞掉，查了十几轮）。
+3. **`Biomes` 必须小**。跨插件的表是**拷贝**的，铺满视野代价不可接受
+   （size=16 是 256x256 = 65536 项 × 7 种结构，每项还要在对方状态里新建一个键字符串）。
+   所以走**两趟**：先不带群系跑一趟，把"不确定"的收上来，第二趟只补这些坐标 ——
+   非村庄类只需**原点方块**一项，村庄需要原点区块的**256 列**（它要拿整块地判 pool 的 AllowedBiomes）。
+   实测村庄那次供了 256 项，其余种类通常是 0 项（没有快照就干脆不供）。
+4. **第二趟的结果整体替换第一趟**（而不是合并）。更准确的答案可能把"不确定"变成"否"——
+   实测那个 `?` 村庄就是这样被正确否掉的（网格候选点，但当地群系不满足 AllowedBiomes），
+   也就是**之前画的是假阳性**。
 
-代价：一次渲染最多多 7 次跨插件调用。要关掉就把 `[Render] DrawStructures` 设 0。
+代价：一次渲染最多 7 次（有需要时 14 次）跨插件调用。要关掉就把 `[Render] DrawStructures` 设 0。
 
 自动补全：`render` 任务结束后，若 `Meta.WarmMissingUnknown > 0` 且到冷却期，就在 tick 线程直接
 `ChunkStay` 排一批（从未见过的优先）。
