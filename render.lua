@@ -993,12 +993,15 @@ function R.Render(World, Opts)
 	local GridFactor = 0.74
 	local Shade = Cfg.RememberedShade
 
+	-- 每批用一次 char(unpack(...))；上限 2048 是为了不撞 Lua 的 unpack 参数上限
+	local PIXEL_BATCH = 2048
+
 	local Out = {}
 	for bz = 0, Blocks - 1 do
 		local RowChunk = floor(bz / 16)
 		local ty = bz % 16
 		local RowChunkBase = RowChunk * SizeChunks
-		local Row, n = {}, 0
+		local Row, Buf, Bn = {}, {}, 0
 
 		for bx = 0, Blocks - 1 do
 			local Cr, Cg, Cb
@@ -1084,8 +1087,20 @@ function R.Render(World, Opts)
 			if (Cg > 255) then Cg = 255 elseif (Cg < 0) then Cg = 0 end
 			if (Cb > 255) then Cb = 255 elseif (Cb < 0) then Cb = 0 end
 
-			n = n + 1
-			Row[n] = char(Cr, Cg, Cb):rep(Scale)
+			-- 数字缓冲 + char(unpack(...)) 分批：原来每个格子是 char() 加 :rep()
+			-- 两次分配，大视野下就是百万级可回收对象。表里放数字不进 GC。
+			for _ = 1, Scale do
+				Bn = Bn + 1; Buf[Bn] = Cr
+				Bn = Bn + 1; Buf[Bn] = Cg
+				Bn = Bn + 1; Buf[Bn] = Cb
+				if (Bn >= PIXEL_BATCH) then
+					Row[#Row + 1] = char(unpack(Buf, 1, Bn))
+					Bn = 0
+				end
+			end
+		end
+		if (Bn > 0) then
+			Row[#Row + 1] = char(unpack(Buf, 1, Bn))
 		end
 
 		local RowStr = concat(Row)

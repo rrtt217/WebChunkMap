@@ -99,6 +99,10 @@ MaybeSave()                          -- 到点且有改动才把快照落盘
 
 > 加这道闸的教训：`R.LastAction` 那套只写不读，是死代码 —— 别照抄。
 
+两个可调的量（都在 `[Cache]`）：`MaxLoadedChunks`（总量阀门）、`MaxWarmChunks`
+（手动按钮单次上限，默认 512，**约 100 MB 常驻内存**）。后者原来硬编码在 `web.lua`，
+raspi 上想单独调小都做不到，现在挪进了配置。`AutoLoadMaxChunks` 管的是自动补全。
+
 ---
 
 ## 2. 文件结构

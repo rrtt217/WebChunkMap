@@ -66,6 +66,7 @@ local function ReadSettings(Folder)
 		SaveInterval     = Ini:GetValueSetI("Cache", "SaveInterval", 300),
 		AutoLoadOnView   = Ini:GetValueSetB("Cache", "AutoLoadOnView", true),
 		AutoLoadMax      = Ini:GetValueSetI("Cache", "AutoLoadMaxChunks", 256),
+		MaxWarmChunks    = Ini:GetValueSetI("Cache", "MaxWarmChunks", 512),
 		AutoLoadCooldown = Ini:GetValueSetI("Cache", "AutoLoadCooldown", 10),
 	}
 end
@@ -231,6 +232,7 @@ function Initialize(Plugin)
 	WCM_Web.DefaultScale = Cfg.DefaultScale
 	WCM_Web.DefaultMode  = Cfg.DefaultMode
 	WCM_Web.InlineImages = Cfg.InlineImages
+	WCM_Web.MaxWarmChunks = Cfg.MaxWarmChunks
 
 	-- 默认世界只在这里解析一次。Initialize 不在世界 tick 线程上，读 cRoot 是安全的
 	-- （只是查世界列表，不碰 chunkmap），不能放到 RefreshWorldCache 里按"先到先得"决定。

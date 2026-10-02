@@ -69,6 +69,10 @@ SaveInterval=300
 AutoLoadOnView=1
 ; 自动补全单次上限（比手动按钮的 512 小，避免一次生成太多）
 AutoLoadMaxChunks=256
+; 手动「加载可见区块」按钮的单次上限。
+; 注意每个区块约 150~200 KB **常驻内存**（Cuberite 的 chunkmap 持有），512 就是约 100 MB。
+; 小内存机器务必调小（树莓派建议 32~64）。自动补全用的是 AutoLoadMaxChunks，不是这个。
+MaxWarmChunks=512
 ; 同一区域的自动补全冷却（秒）。
 ; 要小于页面自动刷新的 6 秒，否则刷新时还在冷却期、补全链会中断。
 AutoLoadCooldown=5
