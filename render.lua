@@ -291,15 +291,13 @@ function R.SaveTiles(Force)
 		return 0, "no-io"
 	end
 
-	local Body = {}
+	-- 第一趟只数数（不建任何字符串）：文件头的记录数得先知道。
+	-- 原来是把全部记录攒进 Body 再一次 concat，于是同时攥住 ~8 MB 记录
+	-- 加 7.6 MB 拼接结果；而且打日志时又 concat 了一遍，等于每次落盘拷两次全量。
 	local Count = 0
 	for WorldName, Tiles in pairs(R.Tiles) do
-		local NameLen = #WorldName
-		if (NameLen <= 255) then
-			for Key, Tile in pairs(Tiles) do
-				local CX = floor(Key / 2097152) - 1048576
-				local CZ = (Key % 2097152) - 1048576
-				Body[#Body + 1] = char(NameLen) .. WorldName .. PackI32(CX) .. PackI32(CZ) .. Tile
+		if (#WorldName <= 255) then
+			for _ in pairs(Tiles) do
 				Count = Count + 1
 			end
 		end
@@ -318,9 +316,36 @@ function R.SaveTiles(Force)
 	end
 
 	F:write(MAGIC, PackU16(VERSION), PackU32(Count))
-	if (#Body > 0) then
-		F:write(concat(Body))
+
+	-- 第二趟分批写：峰值 ≈ 一批（512 条约 0.7 MB），而不是"全部记录 + 全量拼接"两倍。
+	-- 顺带把 char(NameLen) .. WorldName 提到世界循环外，每个区块少一次拼接。
+	-- 分批写：峰值 ≈ 一批（512 条约 0.7 MB），而不是"全部记录 + 全量拼接"两倍。
+	-- 顺带把 char(NameLen) .. WorldName 提到世界循环外，每个区块少一次拼接。
+	local Batch, Bytes = {}, 0
+	local function Flush()
+		if (#Batch == 0) then
+			return
+		end
+		local S = concat(Batch)
+		F:write(S)
+		Bytes = Bytes + #S
+		Batch = {}
 	end
+	for WorldName, Tiles in pairs(R.Tiles) do
+		local NameLen = #WorldName
+		if (NameLen <= 255) then
+			local Prefix = char(NameLen) .. WorldName
+			for Key, Tile in pairs(Tiles) do
+				local CX = floor(Key / 2097152) - 1048576
+				local CZ = (Key % 2097152) - 1048576
+				Batch[#Batch + 1] = Prefix .. PackI32(CX) .. PackI32(CZ) .. Tile
+				if (#Batch >= 512) then
+					Flush()
+				end
+			end
+		end
+	end
+	Flush()
 	F:close()
 
 	if (os ~= nil) and (os.rename ~= nil) then
@@ -329,7 +354,8 @@ function R.SaveTiles(Force)
 
 	R.Dirty = {}
 	R.LastSave = Now()
-	Log(string.format("区块快照已保存：%d 个区块，%.1f KiB", Count, (#concat(Body) + 11) / 1024))
+	-- 字节数在写的时候累计，不要再 concat 一遍全量（那是 7.6 MB 的纯浪费）
+	Log(string.format("区块快照已保存：%d 个区块，%.1f KiB", Count, (Bytes + 11) / 1024))
 	return Count, "saved"
 end
 
@@ -350,46 +376,65 @@ function R.LoadTiles(Folder)
 		return 0
 	end
 
-	local Data = F:read("*a")
-	F:close()
-	if (Data == nil) or (#Data < 11) or (Data:sub(1, 4) ~= MAGIC) then
+	-- 流式读：先读 11 字节文件头，再逐条读记录。
+	-- 原来是 read("*a") 把整个文件攥在手里（几千个区块时约 7.6 MB），
+	-- 每个区块还要 Data:sub() 再拷一份 —— 启动时峰值约两倍。
+	-- 快照本身（7.6 MB）是必须留的，能省的是那份"整文件副本"。
+	-- ⚠ 文件头是 **10** 字节：MAGIC(4) + u16 版本(2) + u32 记录数(4)。
+	-- 这里踩过坑：写成 F:read(11) 会多吃掉第一条记录的第一个字节，
+	-- 于是每条记录都错位一个字节 —— 解析出来全是乱码世界名，而因为只校验
+	-- "#Tile == TILE_SIZE"，它**一声不吭地全收下了**，下次保存再把乱码写回文件。
+	-- （原版读整个文件用的 Data:sub(11, ...) 是 Lua 的 1-based 下标，本来就是对的。）
+	local Head = F:read(10)
+	if (Head == nil) or (#Head < 10) or (Head:sub(1, 4) ~= MAGIC) then
+		F:close()
 		Log("快照文件头无效，忽略")
 		return 0
 	end
 
-	local Ver = UnpackU16(Data, 5)
+	local Ver = UnpackU16(Head, 5)
 	if (Ver ~= VERSION) then
+		F:close()
 		Log("快照版本不匹配（文件 " .. tostring(Ver) .. "，期望 " .. VERSION .. "），忽略")
 		return 0
 	end
 
-	local Count = UnpackU32(Data, 7)
-	local P = 11
-	local Loaded = 0
+	local Count = UnpackU32(Head, 7)
+	local Loaded, Bytes = 0, 0
 	for _ = 1, Count do
-		local NameLen = Data:byte(P)
-		if (NameLen == nil) then
+		local LenB = F:read(1)
+		if (LenB == nil) then
 			break
 		end
-		P = P + 1
-		local WorldName = Data:sub(P, P + NameLen - 1)
-		P = P + NameLen
-		local CX = UnpackI32(Data, P)
-		P = P + 4
-		local CZ = UnpackI32(Data, P)
-		P = P + 4
-		local Tile = Data:sub(P, P + TILE_SIZE - 1)
-		P = P + TILE_SIZE
+		local NameLen = LenB:byte(1)
+		local RecordBytes = NameLen + 8 + TILE_SIZE
+		local Rest = F:read(RecordBytes)
+		if (Rest == nil) or (#Rest < RecordBytes) then
+			break
+		end
+		local WorldName = Rest:sub(1, NameLen)
+		-- 防御：名字长度/字符集明显不合理就认定文件损坏，立刻停。
+		-- 这条是踩出来的 —— 一个 off-by-one 让整份快照被当成"合法但名字是乱码"
+		-- 的数据读了进来（只校验 #Tile == TILE_SIZE 是拦不住的）。
+		if (NameLen == 0) or (NameLen > 32) or (WorldName:find("[^%w_%-]") ~= nil) then
+			Log(string.format("快照第 %d 条的世界名不合法（名长 %d），文件可能损坏，停止解析", Loaded + 1, NameLen))
+			break
+		end
+		local CX = UnpackI32(Rest, NameLen + 1)
+		local CZ = UnpackI32(Rest, NameLen + 5)
+		local Tile = Rest:sub(NameLen + 9, NameLen + 8 + TILE_SIZE)
 		if ((CX ~= nil) and (CZ ~= nil) and (#Tile == TILE_SIZE)) then
 			R.PutTile(WorldName, CX, CZ, Tile, true)
 			Loaded = Loaded + 1
+			Bytes = Bytes + 1 + RecordBytes
 		else
 			break
 		end
 	end
+	F:close()
 
 	R.Dirty = {}
-	Log("已载入 " .. Loaded .. " 个区块快照（" .. string.format("%.1f", #Data / 1024) .. " KiB）")
+	Log("已载入 " .. Loaded .. " 个区块快照（" .. string.format("%.1f", (Bytes + 11) / 1024) .. " KiB）")
 	return Loaded
 end
 

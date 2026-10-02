@@ -98,20 +98,33 @@ local function Chunk(Type, Data)
 end
 
 --- 把一行原始像素做 Sub 滤波（PNG filter type 1），对成片同色区域压缩率提升明显。
+-- 每批用一个 string.char(unpack(...)) 产出字符串，而不是每字节一个 char()。
+-- 1000x1000 的图有 300 万个字节：原来会造出 300 万个**可回收对象**
+--（每字节一个单字符字符串 + 一个表项），这是实打实的 GC 压力。
+-- 改成数字缓冲后表里放的是数字（数字不进 GC），字符串只在每批边界产生一次。
+-- 上限 2048 是为了不撞 Lua 的 unpack 参数上限（C 栈，通常 8000）。
+local SUBFILTER_BATCH = 2048
+
 local function SubFilter(Row)
-	local Out = { "\1" }
-	local n = 0
-	local Bpp = 3
+	local Out = {}
+	local Buf, Bn = {}, 0
 	for i = 1, #Row do
 		local Cur = Row:byte(i)
 		local Left = 0
-		if (i > Bpp) then
-			Left = Row:byte(i - Bpp)
+		if (i > 3) then
+			Left = Row:byte(i - 3)
 		end
-		n = n + 1
-		Out[n + 1] = char((Cur - Left) % 256)
+		Bn = Bn + 1
+		Buf[Bn] = (Cur - Left) % 256
+		if (Bn >= SUBFILTER_BATCH) then
+			Out[#Out + 1] = char(unpack(Buf, 1, Bn))
+			Bn = 0
+		end
 	end
-	return table.concat(Out)
+	if (Bn > 0) then
+		Out[#Out + 1] = char(unpack(Buf, 1, Bn))
+	end
+	return "\1" .. table.concat(Out)
 end
 
 --- 把 RGB 原始像素编码成 PNG。
