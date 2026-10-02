@@ -33,8 +33,6 @@ DrawChunkGrid=1
 HillShading=1
 ; 在地图上标出在线玩家与出生点
 DrawPlayers=1
-; 在地图上标出在线玩家与出生点
-DrawPlayers=1
 ; 在地图上标出结构位置（村庄 / 废弃矿井 / 神殿 …）。
 ; 数据来自 VanillaFeatureComplement 插件的 Locate API：如果那个插件没装，
 ; 这项就等于没开——插件会静默跳过，不报错也不写日志。
