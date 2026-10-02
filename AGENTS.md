@@ -114,6 +114,29 @@ MaybeSave()                          -- 到点且有改动才把快照落盘
   既不重绘地图也不重载页面 —— 整页重载会在用户点下一个区块时打乱页面，
   点击落到已选中的区块上就变成了"取消"，表现为"选第二个区块时全被取消"。
 
+### 结构位置（唯一的跨插件调用）
+
+地图上的结构标记来自 **VanillaFeatureComplement** 的 Locate API，走
+`cPluginManager:CallPlugin("VanillaFeatureComplement", …)`：
+
+| 函数 | 说明 |
+| --- | --- |
+| `StructureLocateAPIVersion()` | 返回 1；用来判断对方在不在 |
+| `StructureLocateKinds()` | 7 种结构名 |
+| `StructureLocateFind(World, Kind, X, Z, RadiusChunks)` | `{Ok=true, Display, X, Z, Confirmed, …}` / `{Ok=false, Error}` / **nil**（插件没装或函数名不对） |
+
+三条硬约束：
+
+1. **只能在 tick 线程调用**。对方内部要读世界（判断区块是否已生成），从 WebAdmin 的
+   HTTP 线程调就会锁序反转 —— 所以它放在 `R.Render` 里，不在 `web.lua` 里。
+2. **失败一律静默**。整段包 `pcall`，`Ok=false` / nil / 抛错都当作"没有结构"，
+   既不写日志也不在页面上冒错误（用户明确要求）。查询次数本身也限流：
+   `StructKinds()` 最多每 60 秒探一次，免得对方每次渲染都往日志写 "Function not found"。
+3. **搜索窗口只盖住视野**（`ceil(SizeChunks/2)` 个区块），别用对方默认的 100 ——
+   窗口越大它扫的网格单元越多。实测 7 种结构查一遍约 42 ms。
+
+代价：一次渲染最多多 7 次跨插件调用。要关掉就把 `[Render] DrawStructures` 设 0。
+
 自动补全：`render` 任务结束后，若 `Meta.WarmMissingUnknown > 0` 且到冷却期，就在 tick 线程直接
 `ChunkStay` 排一批（从未见过的优先）。
 

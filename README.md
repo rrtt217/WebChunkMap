@@ -72,6 +72,7 @@ WebAdmin 需要登录，账号看 `webadmin.ini` 的 `[User:*]` 段。
 | | `DefaultSizeChunks` / `DefaultScale` / `DefaultMode` | 打开时的默认视野 |
 | `[Render]` | `CacheTTL` | 缓存的后台刷新阈值（秒）。不影响页面响应；想立刻更新勾「强制重绘」 |
 | | `DrawChunkGrid` / `HillShading` / `DrawPlayers` | 图层元素开关 |
+| | `DrawStructures` | 在地图上标出结构位置（依赖 VanillaFeatureComplement） |
 | `[Cache]` | `RememberChunks` | 是否记住曾经加载过的区块 |
 | | `MaxChunks` | 快照数量上限 |
 | | `AutoLoadOnView` | 平移时是否自动补全地形 |

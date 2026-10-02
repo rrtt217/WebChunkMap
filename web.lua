@@ -122,6 +122,24 @@ local function Hidden(Name, Value)
 	return "<input type='hidden' name='" .. Esc(Name) .. "' value='" .. Esc(Value) .. "'>"
 end
 
+--- 把结构列表压成一行可读文本；没有就返回破折号（失败时页面不该冒出错误）。
+local function StructureSummary(List)
+	if (List == nil) or (#List == 0) then
+		return "—"
+	end
+	local Parts = {}
+	for i, S in ipairs(List) do
+		if (i > 8) then
+			Parts[#Parts + 1] = "…"
+			break
+		end
+		Parts[#Parts + 1] = Esc(S.Display or S.Kind) .. " ["
+			.. tostring(S.X) .. ", " .. tostring(S.Z) .. "]"
+			.. (S.Confirmed and "" or "<sup>?</sup>")
+	end
+	return table.concat(Parts, " · ")
+end
+
 local function Swatch(Hex)
 	return "<span class='wcm-sw' style='background:" .. Hex .. "'></span>"
 end
@@ -546,6 +564,11 @@ local function BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, Inf
 	A("<th>区块快照</th><td>" .. Meta.TotalTiles .. " 个</td></tr>")
 	A("<tr><th>本世界</th><td>已加载 " .. Meta.LoadedChunks .. " 个区块</td>")
 	A("<th>在线玩家</th><td>" .. Meta.Players .. "</td></tr>")
+	if (WCM_Render.Config.DrawStructures) then
+		A("<tr><th>结构位置</th><td colspan='3'>" .. StructureSummary(Meta.Structures))
+		A(" <span style='color:#777'>（来自 VanillaFeatureComplement 的 Locate API；"
+			.. "带 <sup>?</sup> 的是未经确认的位置）</span></td></tr>")
+	end
 	A("</table>")
 
 	------------------------------------------------------------------
@@ -577,6 +600,17 @@ local function BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, Inf
 	A(Swatch("#E63C3C") .. "玩家")
 	A(Swatch("#46A0FF") .. "出生点")
 	A(Swatch("#C14544") .. "选中")
+	if (Meta.Structures ~= nil) and (#Meta.Structures > 0) then
+		local Seen = {}
+		for _, S in ipairs(Meta.Structures) do
+			if not Seen[S.Kind] then
+				Seen[S.Kind] = true
+				local C = (WCM_Render.StructureColors or {})[S.Kind]
+				A(Swatch(C and string.format("#%02X%02X%02X", C[1], C[2], C[3]) or "#E1E1E1")
+					.. Esc(S.Display or S.Kind))
+			end
+		end
+	end
 	A("</p>")
 
 	------------------------------------------------------------------

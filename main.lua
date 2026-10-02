@@ -56,6 +56,7 @@ local function ReadSettings(Folder)
 		DrawChunkGrid = Ini:GetValueSetB("Render", "DrawChunkGrid", true),
 		HillShading   = Ini:GetValueSetB("Render", "HillShading", true),
 		DrawPlayers   = Ini:GetValueSetB("Render", "DrawPlayers", true),
+		DrawStructures = Ini:GetValueSetB("Render", "DrawStructures", true),
 		PngFactor     = Ini:GetValueSetI("Render", "PngCompression", 6),
 
 		RememberTiles    = Ini:GetValueSetB("Cache", "RememberChunks", true),
@@ -251,6 +252,7 @@ function Initialize(Plugin)
 		HillShading = Cfg.HillShading,
 		DrawPlayers = Cfg.DrawPlayers,
 		DrawSpawn = Cfg.DrawPlayers,
+		DrawStructures = Cfg.DrawStructures,
 		PngFactor = Cfg.PngFactor,
 		RememberTiles = Cfg.RememberTiles,
 		RememberedShade = Cfg.RememberedShade,

@@ -24,6 +24,7 @@ R.Config = {
 	HillShading = true,
 	DrawPlayers = true,
 	DrawSpawn = true,
+	DrawStructures = true,    -- 在地图上标出结构位置（跨插件调用 VanillaFeatureComplement 的 Locate API）
 	PngFactor = 6,
 
 	RememberTiles = true,     -- 是否记住曾经加载过的区块
@@ -511,6 +512,123 @@ end
 -- 渲染
 ----------------------------------------------------------------------
 
+----------------------------------------------------------------------
+-- 结构位置（跨插件）
+----------------------------------------------------------------------
+
+--- 每种结构一个颜色，认不出来的用灰白兜底。
+local STRUCTURE_COLORS = {
+	Mineshaft      = { 130, 130, 140 },
+	Village        = { 240, 180,  55 },
+	Desert_Pyramid = { 245, 220, 130 },
+	Jungle_Pyramid = {  60, 170,  80 },
+	Swamp_Hut      = { 120,  70, 150 },
+	Desert_Well    = { 205, 195, 115 },
+	Fortress       = { 200,  60,  60 },
+}
+local STRUCTURE_FALLBACK = { 225, 225, 225 }
+R.StructureColors = STRUCTURE_COLORS    -- 给 web.lua 画图例用
+
+--- 目标插件只暴露这三个顶层全局函数（详情见对方 structure_locate.lua 第 8 节）：
+---   StructureLocateAPIVersion() -> number
+---   StructureLocateKinds()      -> { "Mineshaft", "Village", ... }
+---   StructureLocateFind(World, Kind, X, Z, RadiusChunks)
+---        -> { Ok = true, Display, X, Y, Z, Distance, Confirmed, ... }
+---        -> { Ok = false, Error }   插件在，但这次问不出来
+---        -> nil                     插件没装 / 函数名对不上
+---
+--- 注意两点：
+---  * 它内部会读世界（Eligibility 要判断区块是否已生成），所以**只能在 tick 线程调用**，
+---    不能从 WebAdmin 的 HTTP 线程碰（会锁序反转，见 AGENTS.md 铁律一）。
+---  * 查不到就静默跳过。用户要求"失败时不显示错误"，所以既不抛错也不往日志写东西。
+local StructProbe = { Time = -1e9, Kinds = nil }
+
+--- 问一次对方支持哪些结构；最多每 60 秒探一次，失败也不吵。
+local function StructKinds()
+	local T = Now()
+	if ((T - StructProbe.Time) < 60) then
+		return StructProbe.Kinds
+	end
+	StructProbe.Time = T
+	local Kinds = nil
+	pcall(function ()
+		Kinds = cPluginManager:CallPlugin("VanillaFeatureComplement", "StructureLocateKinds")
+	end)
+	if (type(Kinds) == "table") and (#Kinds > 0) then
+		StructProbe.Kinds = Kinds
+	else
+		StructProbe.Kinds = nil
+	end
+	return StructProbe.Kinds
+end
+
+--- 收集视野内的结构位置。返回 标记表, 结构列表（都可能是 nil）。
+local function CollectStructures(World, OriginX, OriginZ, Blocks, SizeChunks)
+	local Kinds = StructKinds()
+	if (Kinds == nil) then
+		return nil, nil
+	end
+
+	-- 搜索窗口只要刚好盖住视野即可；窗口越大对方扫的网格单元越多。
+	local Window = math.max(1, math.ceil(SizeChunks / 2))
+	local QueryX = OriginX + floor(Blocks / 2)
+	local QueryZ = OriginZ + floor(Blocks / 2)
+
+	local Markers = {}
+	local Found = {}
+	local function Plot(BlockX, BlockZ, Cr, Cg, Cb, Radius)
+		local BaseBX = floor(BlockX) - OriginX
+		local BaseBZ = floor(BlockZ) - OriginZ
+		for dx = -Radius, Radius do
+			for dz = -Radius, Radius do
+				local bx, bz = BaseBX + dx, BaseBZ + dz
+				if (bx >= 0) and (bx < Blocks) and (bz >= 0) and (bz < Blocks) then
+					Markers[bx * 4096 + bz] = { Cr, Cg, Cb }
+				end
+			end
+		end
+	end
+
+	for _, Kind in ipairs(Kinds) do
+		local Res = nil
+		pcall(function ()
+			Res = cPluginManager:CallPlugin("VanillaFeatureComplement", "StructureLocateFind",
+				World, Kind, QueryX, QueryZ, Window)
+		end)
+		if (type(Res) == "table") and (Res.Ok == true)
+			and (type(Res.X) == "number") and (type(Res.Z) == "number") then
+			local bx = floor(Res.X) - OriginX
+			local bz = floor(Res.Z) - OriginZ
+			if (bx >= 0) and (bx < Blocks) and (bz >= 0) and (bz < Blocks) then
+				local C = STRUCTURE_COLORS[Kind] or STRUCTURE_FALLBACK
+				-- 未确认的（对方只敢猜的）画成空心：先铺底色再挖中心
+				if (Res.Confirmed == true) then
+					Plot(Res.X, Res.Z, C[1], C[2], C[3], 2)
+					Plot(Res.X, Res.Z, 255, 255, 255, 0)
+				else
+					Plot(Res.X, Res.Z, C[1], C[2], C[3], 2)
+					Plot(Res.X, Res.Z, 0, 0, 0, 1)
+				end
+				Found[#Found + 1] = {
+					Kind = Kind,
+					Display = Res.Display or Kind,
+					X = Res.X, Y = Res.Y, Z = Res.Z,
+					Confirmed = (Res.Confirmed == true),
+					Distance = Res.Distance,
+				}
+			end
+		end
+	end
+
+	if (#Found == 0) then
+		return nil, nil
+	end
+	table.sort(Found, function (A, B)
+		return (A.Distance or 0) < (B.Distance or 0)
+	end)
+	return Markers, Found
+end
+
 --- 收集需要画在地图上的标记（在线玩家 + 出生点）。
 local function CollectMarkers(World, OriginX, OriginZ, Blocks)
 	local Markers = {}
@@ -671,6 +789,16 @@ function R.Render(World, Opts)
 		Markers, PlayerCount = CollectMarkers(World, OriginX, OriginZ, Blocks)
 	end
 
+	-- 结构位置（跨插件）。整段包 pcall：对方插件没装、函数改名、内部报错，
+	-- 一律当作"没有结构"处理，不往页面和日志里冒错误。
+	local StructMarkers, Structures = nil, nil
+	if Cfg.DrawStructures then
+		local OkS, M, L = pcall(CollectStructures, World, OriginX, OriginZ, Blocks, SizeChunks)
+		if OkS then
+			StructMarkers, Structures = M, L
+		end
+	end
+
 	local GridFactor = 0.74
 	local Shade = Cfg.RememberedShade
 
@@ -745,6 +873,14 @@ function R.Render(World, Opts)
 				Cb = floor(Cb * GridFactor)
 			end
 
+			-- 结构标记（压在玩家 / 出生点下面，别把玩家盖住）
+			if (StructMarkers ~= nil) then
+				local Mk = StructMarkers[bx * 4096 + bz]
+				if (Mk ~= nil) then
+					Cr, Cg, Cb = Mk[1], Mk[2], Mk[3]
+				end
+			end
+
 			-- 玩家 / 出生点标记
 			if (Markers ~= nil) then
 				local Mk = Markers[bx * 4096 + bz]
@@ -783,6 +919,7 @@ function R.Render(World, Opts)
 		Width = ImgSize,
 		Height = ImgSize,
 		Players = PlayerCount,
+		Structures = Structures,
 		OriginChunkX = BaseCX,
 		OriginChunkZ = BaseCZ,
 		CenterBlockX = OriginX + floor(Blocks / 2),
