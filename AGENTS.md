@@ -99,6 +99,42 @@ MaybeSave()                          -- 到点且有改动才把快照落盘
 
 > 加这道闸的教训：`R.LastAction` 那套只写不读，是死代码 —— 别照抄。
 
+### ChunkStay 的两个坑（读引擎源码确认，别再踩）
+
+**根因**：`src/ChunkGeneratorThread.cpp`
+
+    // Skip the chunk if the generator is overloaded:
+    if (SkipEnabled && !m_ChunkSink->HasChunkAnyClients(item.m_Coords))
+    {
+        LOGWARNING("Chunk generator overloaded, skipping chunk %s", ...);
+        item.m_Callback->Call(item.m_Coords, false);   // false = 没生成
+        continue;
+    }
+
+而 `cChunk::HasAnyClients()` 就是 `return !m_LoadedByClient.empty();` ——
+**只有玩家算 client**。所以 **ChunkStay 要的区块一个 client 都没有，过载时正是被丢的那批**。
+
+被丢之后 `cChunk::MarkLoadFailed()` 会 MarkDirty() 再 QueueGenerateChunk()：区块**被反复重排**，
+只要生成器还在过载就反复被 skip（日志里那几千条 warning 就是重试风暴）。它永远拿不到
+IsValid()，于是 **ChunkAvailable 永不调用 -> OnAllChunksAvailable 永不触发**，
+而这些区块被 Stay(true) 标记、**永不参与卸载**。
+
+**后果（实测）**：一次要 625 个区块 -> 生成器跳过 123 个（日志正好 123 条）->
+整批 625 个（含已加载好的 502 个）被永久钉住，完成回调永不执行。
+**这就是"用半天堆到 5965 个区块、从不释放"的根因。**
+
+**两道防护（都别拆）**：
+1. `STAY_BATCH = 64`（`LoadInBatches`）：把单次 stay 的规模压到生成器吃得下的水平。
+   实测 400 个区块分 7 批加载，**过载告警一条都没新增**，且加载完后**区块被正常释放**。
+2. 看门狗 + 黑名单（`R.CheckStays` / `R.BadChunks`）：45 秒没回来的批次就拉黑并跳过，
+   把损失限制在一批以内。黑名单**带 600 秒过期**——因为引擎其实会重排，过载缓解后是有救的。
+   统计出口是 `WebChunkMap_MemStats()` 的 StayStarted/StayDone/StayInFlight/BadChunks。
+
+> **修正一个曾经的误判**：我一开始按黑盒实验以为"列表里含已加载区块会让 stay 悬住"。
+> 读源码否定了：`cChunkMap::AddChunkStay` 对已经 valid 的区块**会**逐个调 ChunkAvailable。
+> 当时"4 个区块只回调 1 次"真正的原因是那 4 个里有 3 个处于 queued 状态并被 skip 了。
+> **教训：黑盒现象要先读源码再下结论**（源码在 raspi 的 ~/compile-cuberite/cuberite/src/）。
+
 两个可调的量（都在 `[Cache]`）：`MaxLoadedChunks`（总量阀门）、`MaxWarmChunks`
 （手动按钮单次上限，默认 512，**约 100 MB 常驻内存**）。后者原来硬编码在 `web.lua`，
 raspi 上想单独调小都做不到，现在挪进了配置。`AutoLoadMaxChunks` 管的是自动补全。

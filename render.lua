@@ -84,6 +84,17 @@ end
 
 R.TickCount = 0
 
+--- ChunkStay 统计：跨插件/引擎侧唯一能观察到"悬住的 stay"的地方。
+--- 为什么需要：ChunkStay 的完成回调只在**所有**区块就绪时才触发，
+--- 而被过载的生成器 skip 掉的区块可能永远不就绪 —— 那样这些区块会一直被钉住
+---（stay 标记让 QueueUnloadUnusedChunks 不会卸载它们），而 Lua 这边看上去一切正常。
+--- Started 与 Done 长期对不上，就是有 stay 悬住了。
+R.StayStats = {
+	Started = 0,   -- 发起过多少个 ChunkStay
+	Done    = 0,   -- 其中多少个回调真的回来了
+	Chunks  = 0,   -- 累计请求过多少个区块
+}
+
 local function Now()
 	if (os ~= nil) and (os.time ~= nil) then
 		return os.time()
@@ -1521,6 +1532,162 @@ local function RefuseLoad(World, Job, Loaded, Max)
 	end
 end
 
+--- 只保留"当前尚未加载"的区块。
+---
+--- ⚠ 为什么必须筛（实测出来的，不是理论洁癖）：
+--- cWorld:ChunkStay 对**已经加载**的区块不会逐个触发 OnChunkAvailable ——
+--- 给 4 个已加载区块发 stay，逐块回调只响了 **1 次**，于是 OnAllChunksAvailable
+--- **永远不触发**。后果有两层：
+---   1. 这个 stay 永久悬住，它包含的区块被 stay 标记钉死，永远不参与卸载
+---      （实测：625 个区块的 stay 悬了 3 分钟以上，已加载数一路只增不减）；
+---   2. 完成回调永不执行 —— 自动补全的重绘、regen 后的快照重建全部失效。
+--- 对照实验：2 个**未加载**区块 -> 逐块回调 2 次、全部就绪回调 1 次，
+--- 加载完 2 秒后它们就被释放了（17011 -> 17009）。所以只要列表干净，stay 是正常的。
+---
+--- 这解释了插件最早那个"用半天堆到 5965 个区块、从不释放"的现象：
+--- 视野里本来就既有已加载也有未加载的区块，混在一起发 stay 必然悬住。
+local function IsChunkInMemory(World, C)
+	return World:TryGetHeight(C[1] * 16 + 8, C[2] * 16 + 8) and true or false
+end
+
+--- 暂时拉黑的区块：本次会话里已经确认"发出去也等不到"的那些。
+---
+--- 依据：被生成器过载 skip 掉的区块会卡在 queued 状态，IsValid() 一直为假，
+--- 于是 ChunkStay 的 ChunkAvailable 永远不会被调用。而**一个这样的区块就足以让
+--- 整批区块悬住**（整批被 Stay(true) 钉死、完成回调永不执行），所以必须能跳过它们。
+---
+--- 为什么是"暂时"而不是永久：引擎其实**会重排**（cChunk::MarkLoadFailed 里
+--- MarkDirty() 之后又 QueueGenerateChunk()），只是生成器还在过载时会再次被 skip。
+--- 过载缓解后这些区块是有救的，所以给一个过期时间，到点再试。
+R.BadChunks = {}    -- [世界名] = { [区块键] = 拉黑时刻 }
+local BAD_CHUNK_TTL = 600    -- 秒：拉黑 10 分钟后允许重试
+
+local STAY_STALE = 45    -- 秒：一个批次超过这么久没回来，就认定它等不到了
+local PendingStays = {}  -- 在飞的批次，供看门狗超时接管
+
+-- 一次 ChunkStay 最多要多少个区块。
+-- 为什么要封顶（实测）：一次要 625 个会让生成器队列溢出，它**跳过**了其中 123 个
+--（日志里新增的 "Chunk generator overloaded, skipping chunk" 正好也是 123 条），
+-- 被跳过的区块永远不就绪 -> OnAllChunksAvailable 永远不触发 -> 整个 stay 悬住，
+-- 连已经加载好的那 502 个也被一起钉死。分批把请求速率压到生成器吃得下的水平。
+local STAY_BATCH = 64
+
+--- 分批把这个列表加载进内存，全部就绪（或本来就在内存里）后执行 Done()。
+---
+--- ⚠ 这里有两件必须做的事，都是实测出来的，不是理论洁癖：
+---
+--- 1. **必须分批**（核心）。原因见 STAY_BATCH 的注释：一次要太多会让生成器过载，
+---    而过载时被丢掉的正是不带玩家的区块（也就是 ChunkStay 要的这批）。
+---    被丢的区块永远拿不到 IsValid()，于是 ChunkAvailable 永不调用、
+---    OnAllChunksAvailable 永不触发 —— 整批被 Stay(true) 钉死，Done() 也永不执行。
+---    这就是插件最早那个"正常用半天堆到 5965 个区块、从不释放"的根因。
+---
+--- 2. **列表里不含已加载的区块**：让 stay 更小、完成更快（stay 越大越容易触发过载）。
+---    *修正一个曾经的误判*：我一开始按黑盒实验以为"含已加载区块会让 stay 悬住"，
+---    读源码后否定了 —— cChunkMap::AddChunkStay 对已经 valid 的区块**会**逐个调
+---    ChunkAvailable。当时那个现象（4 个区块只回调 1 次）真正的原因是那 4 个里
+---    有 3 个其实处于 queued 状态并被 skip 了。教训：黑盒现象要先读源码再下结论。
+local function LoadInBatches(World, Queue, Done)
+	local WorldName = World:GetName()
+	local Bad = R.BadChunks[WorldName]
+
+	local function IssueBatch(Index)
+		local Batch = {}
+		while (Index <= #Queue) and (#Batch < STAY_BATCH) do
+			local C = Queue[Index]
+			Index = Index + 1
+			-- 跳过：已经在内存里的，以及暂时拉黑的（后者会把整批拖死）
+			-- 注意别写成 (Bad ~= nil) and Bad[...]：Bad 为 nil 时那个表达式是 false
+			-- 而不是 nil，后面 Now() - BadAt 就会报 "arithmetic on a boolean"。
+			local BadAt = nil
+			if (Bad ~= nil) then
+				BadAt = Bad[ChunkKey(C[1], C[2])]
+			end
+			local IsBad = (BadAt ~= nil) and ((Now() - BadAt) < BAD_CHUNK_TTL)
+			if (not IsBad) and (not IsChunkInMemory(World, C)) then
+				Batch[#Batch + 1] = C
+			end
+		end
+		if (#Batch == 0) then
+			-- 队列扫完了（本来就都在内存里，或已知坏的全部跳过）
+			if (Index > #Queue) then
+				Done()
+			end
+			return
+		end
+
+		R.StayStats.Started = R.StayStats.Started + 1
+		R.StayStats.Chunks = R.StayStats.Chunks + #Batch
+
+		-- 记一笔在飞的批次，交给看门狗（R.CheckStays）超时接管
+		local Rec = { WorldName = WorldName, Queue = Queue, Index = Index, Done = Done, Time = Now(), Batch = Batch }
+		PendingStays[#PendingStays + 1] = Rec
+
+		local Ok = pcall(function ()
+			World:ChunkStay(Batch, nil, function ()
+				R.StayStats.Done = R.StayStats.Done + 1
+				for i = 1, #PendingStays do
+					if (PendingStays[i] == Rec) then
+						table.remove(PendingStays, i)
+						break
+					end
+				end
+				IssueBatch(Index)
+			end)
+		end)
+		if (not Ok) then
+			for i = 1, #PendingStays do
+				if (PendingStays[i] == Rec) then
+					table.remove(PendingStays, i)
+					break
+				end
+			end
+			Done()
+		end
+	end
+
+	IssueBatch(1)
+end
+
+--- 看门狗（每个世界 tick 调一次）：接管超时未完成的批次。
+---
+--- 为什么必须有它：被 skip 过的区块永久卡死（见 R.BadChunks 的注释），而一个坏区块
+--- 就能让整批区块悬住 —— 那些区块会被 stay 标记钉死永不释放，Done()（重绘 / 重建快照）
+--- 也永远不执行。超时后把这一批拉黑、跳过它们继续下一批，就能把损失限制在一批以内。
+function R.CheckStays(World)
+	if (#PendingStays == 0) then
+		return
+	end
+	local WorldName = World:GetName()
+	local T = Now()
+	local i = 1
+	while (i <= #PendingStays) do
+		local Rec = PendingStays[i]
+		if (Rec.WorldName ~= WorldName) or ((T - Rec.Time) < STAY_STALE) then
+			i = i + 1
+		else
+			table.remove(PendingStays, i)
+			local Bad = R.BadChunks[WorldName]
+			if (Bad == nil) then
+				Bad = {}
+				R.BadChunks[WorldName] = Bad
+			end
+			for _, C in ipairs(Rec.Batch) do
+				Bad[ChunkKey(C[1], C[2])] = T
+			end
+			local TLog = Now()
+			if ((TLog - (R.LastStayTimeoutLog or -1e9)) >= 60) then
+				R.LastStayTimeoutLog = TLog
+				Log(string.format(
+					"%s 有 %d 个区块的 ChunkStay 超过 %d 秒未完成（区块被生成器跳过而永久卡死），已拉黑并跳过（日志最多每分钟一条）",
+					WorldName, #Rec.Batch, STAY_STALE))
+			end
+			-- 继续加载剩下的（不再等这一批）
+			LoadInBatches(World, Rec.Queue, Rec.Done)
+		end
+	end
+end
+
 local function RunLoadJob(World, Job)
 	local Opts = Job.Opts
 	local Plan = R.Plan(Opts, World:GetSpawnX(), World:GetSpawnZ())
@@ -1570,21 +1737,18 @@ local function RunLoadJob(World, Job)
 		end
 	end
 
-	local ChunkStayList = {}
-	for i, C in ipairs(ChunkList) do
-		ChunkStayList[i] = { C[1], C[2] }
-	end
-
 	-- 回调本来就在 tick 线程上跑，直接渲染结果写进缓存
 	local RenderOpts = {
 		Mode = Plan.Mode, SizeChunks = Plan.SizeChunks, Scale = Plan.Scale,
 		CenterX = Plan.CenterX, CenterZ = Plan.CenterZ, NoCache = true,
 	}
-	pcall(function ()
-		World:ChunkStay(ChunkStayList, nil, function ()
-			pcall(function ()
-				R.Render(World, RenderOpts)
-			end)
+
+	-- 分批加载；全部就绪后重绘。
+	-- 注意 Done 里调的是 Render 而不是"返回" —— 要的区块本来就在内存里时，
+	-- LoadInBatches 会立刻调 Done，这次渲染不能丢。
+	LoadInBatches(World, ChunkList, function ()
+		pcall(function ()
+			R.Render(World, RenderOpts)
 		end)
 	end)
 end
@@ -1602,20 +1766,21 @@ local function LoadAfterRegen(World, WorldName, ChunkList)
 		return
 	end
 
-	-- ChunkStay 是异步的，回调在所有区块就绪后于 tick 线程上执行
-	pcall(function ()
-		World:ChunkStay(List, nil, function ()
-			for _, C in ipairs(List) do
-				pcall(function ()
-					local Tile = R.BuildTile(World, C[1], C[2])
-					if (Tile ~= nil) then
-						R.PutTile(WorldName, C[1], C[2], Tile)
-					end
-					RefreshChunkInfo(World, { C })
-				end)
-			end
-		end)
-	end)
+	local function Rebuild()
+		for _, C in ipairs(List) do
+			pcall(function ()
+				local Tile = R.BuildTile(World, C[1], C[2])
+				if (Tile ~= nil) then
+					R.PutTile(WorldName, C[1], C[2], Tile)
+				end
+				RefreshChunkInfo(World, { C })
+			end)
+		end
+	end
+
+	-- 走同一套分批加载。regen 的区块通常本来就是已加载的，LoadInBatches 会
+	-- 立刻调 Rebuild（不会白等），所以这里不会退化成"地图上留一个空白洞"。
+	LoadInBatches(World, List, Rebuild)
 end
 
 --- 跨插件调试出口：把插件自己持有的几个表的大小报出来。
@@ -1652,6 +1817,12 @@ function WebChunkMap_MemStats()
 		TileOrder      = Sum(R.TileOrder, true),
 		ChunkInfo      = Sum(R.ChunkInfo, false),
 		ChunkInfoOrder = Sum(R.ChunkInfoOrder, true),
+		StayStarted    = R.StayStats.Started,
+		StayDone       = R.StayStats.Done,
+		StayPending    = R.StayStats.Started - R.StayStats.Done,
+		StayInFlight   = #PendingStays,
+		StayChunks     = R.StayStats.Chunks,
+		BadChunks      = Sum(R.BadChunks, false),
 		CacheEntries   = Count(R.Cache),
 		CacheOrder     = #R.CacheOrder,
 		AutoLoadLast   = Count(R.AutoLoadLast),

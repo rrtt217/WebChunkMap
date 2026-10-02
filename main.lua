@@ -217,6 +217,9 @@ function OnWorldTick(World, TimeDelta)
 		Budget = Budget - 1
 	end
 
+	-- 看门狗：接管超时未完成的 ChunkStay 批次（被生成器 skip 的区块会让整批悬住）
+	WCM_Render.CheckStays(World)
+
 	WCM_Render.MaybeSave()
 end
 
