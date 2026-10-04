@@ -1,9 +1,30 @@
 # WebChunkMap
 
-给 Cuberite **WebAdmin** 加一个「区块地图」标签页：把世界的方块 / 区块数据渲染成 PNG
-（纯 Lua 编码，无外部依赖），可以直接在浏览器里平移、缩放、切换图层，还能点选区块做管理。
+给 Cuberite **WebAdmin** 加一个「区块地图」标签页：把世界的方块 / 区块数据渲染到浏览器的
+canvas 上，可以直接平移、缩放、切换图层，还能点选区块做管理。
 
-![界面](docs/screenshot-topo.png)
+![界面](docs/canvas-page.png)
+
+### 渲染在浏览器里做
+
+服务端不再逐像素画图，而是把每个区块**预打包好的调色板 + 高度 + 状态**拼成一份二进制
+deflate 下发，颜色展开 / 山体阴影 / 区块网格线全部由 `canvas.js` 在浏览器里完成。
+
+**为什么值得**（48x48 视野 = 2304 个区块的实测）：
+
+| | 传输 | 服务端每次渲染 | 浏览器 |
+| --- | --- | --- | --- |
+| 服务端画 PNG | 95.1 B/区块 | **~260 ms（占世界 tick 线程）** | — |
+| 浏览器画 canvas | 95.5 B/区块 | **~34 ms**（只剩拼块 + deflate）| ~35 ms |
+
+也就是**传输体积几乎不变**，换来渲染彻底离开服务端 —— 以前每换一个视野就要占着世界
+tick 线程 200 多毫秒，现在只剩三十几毫秒，而且与缩放到几倍无关（放大由
+`image-rendering: pixelated` 做最近邻，与"服务端复制像素"完全等价）。
+
+需要浏览器支持 `DecompressionStream`（Chrome 80+ / Firefox 113+ / Safari 16.4+）。
+不支持时页面会自动提示，并给一个「改用服务端 PNG」的链接；也可以直接用
+`?canvas=0` 强制走 PNG 路径（那条路没有动，仍是原来的纯 Lua 实现）。
+想彻底关掉画布就把 `[Render] CanvasOnly` 设 0。
 
 ## 使用
 
@@ -71,6 +92,8 @@ WebAdmin 需要登录，账号看 `webadmin.ini` 的 `[User:*]` 段。
 | `[Web]` | `TabTitle` | 标签页名称 |
 | | `DefaultSizeChunks` / `DefaultScale` / `DefaultMode` | 打开时的默认视野 |
 | `[Render]` | `CacheTTL` | 缓存的后台刷新阈值（秒）。不影响页面响应；想立刻更新勾「强制重绘」 |
+| | `CanvasOnly` | **只要画布数据、不出 PNG**。这是省掉 200+ ms 的关键；设 0 就退回服务端画图 |
+| | `ShadeDownsample` | 山体阴影降采样倍率（1 = 每像素都算；2 省 22% 渲染，代价是悬崖阴影边界挪一格）|
 | | `DrawChunkGrid` / `HillShading` / `DrawPlayers` | 图层元素开关 |
 | | `DrawStructures` | 在地图上标出结构位置（依赖 VanillaFeatureComplement） |
 | `[Cache]` | `RememberChunks` | 是否记住曾经加载过的区块 |
