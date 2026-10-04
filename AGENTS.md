@@ -151,6 +151,8 @@ raspi 上想单独调小都做不到，现在挪进了配置。`AutoLoadMaxChunk
 | `blocks.lua` | 方块 / 生物群系 -> 颜色表，未知方块有稳定回退色 |
 | `render.lua` | `Plan`（纯几何）+ `PlanKey` + 区域渲染 + 快照缓存与持久化 + 任务队列 + 世界/区块信息缓存 |
 | `web.lua` | WebAdmin 标签页（只读缓存 + 入队），HTML 用 WebAdmin 自带样式 |
+| `canvas.js` | 浏览器端画布渲染器（解压 + 展开调色板 + 阴影 + 网格）。整个文件由 `main.lua` 读进内存、内联进页面 —— WebAdmin 拿不到裸响应，没法 `<script src>` |
+| `docs/canvas-test.py` | 画布渲染器的验证脚本（生成测试页 + 打印 python 期望指纹）|
 | `settings.ini.example` | 配置模板（进版本库）。`settings.ini` 由 `EnsureSettingsFile()` 在首次启动时复制生成，**被 .gitignore 忽略** |
 
 ---

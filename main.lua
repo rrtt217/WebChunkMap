@@ -61,6 +61,9 @@ local function ReadSettings(Folder)
 		PngFilter     = Ini:GetValueSet("Render", "PngFilter", "none"),
 		ShadeDownsample = Ini:GetValueSetI("Render", "ShadeDownsample", 2),
 		CanvasPayload = Ini:GetValueSetI("Render", "CanvasPayload", 1),
+		CanvasOnly = Ini:GetValueSetI("Render", "CanvasOnly", 0),
+		UseCanvas = Ini:GetValueSetI("Web", "UseCanvas", 1),
+		PluginFolder = Folder,
 
 		RememberTiles    = Ini:GetValueSetB("Cache", "RememberChunks", true),
 		RememberedShade  = Ini:GetValueSetF("Cache", "RememberedShade", 1.0),
@@ -239,6 +242,19 @@ function Initialize(Plugin)
 	WCM_Web.DefaultMode  = Cfg.DefaultMode
 	WCM_Web.InlineImages = Cfg.InlineImages
 	WCM_Web.MaxWarmChunks = Cfg.MaxWarmChunks
+	WCM_Web.UseCanvas = (Cfg.UseCanvas ~= 0)
+
+	-- 画布渲染器：整个文件内联进页面。
+	-- WebAdmin 会把标签页的返回一律包进模板 HTML，插件拿不到"裸响应"，
+	-- 所以没法用 <script src> 引一个插件地址 —— 只能内联。
+	local CF = io.open(Cfg.PluginFolder .. "/canvas.js", "rb")
+	if (CF ~= nil) then
+		WCM_Web.CanvasJs = CF:read("*a")
+		CF:close()
+		LOG("  画布渲染器 " .. string.format("%.1f", #WCM_Web.CanvasJs / 1024) .. " KiB 已载入")
+	else
+		WCM_Web.CanvasJs = nil
+	end
 
 	-- 默认世界只在这里解析一次。Initialize 不在世界 tick 线程上，读 cRoot 是安全的
 	-- （只是查世界列表，不碰 chunkmap），不能放到 RefreshWorldCache 里按"先到先得"决定。
@@ -268,6 +284,7 @@ function Initialize(Plugin)
 		PngFilter = Cfg.PngFilter,
 		ShadeDownsample = Cfg.ShadeDownsample,
 		CanvasPayload = (Cfg.CanvasPayload ~= 0),
+		CanvasOnly = (Cfg.CanvasOnly ~= 0),
 		RememberTiles = Cfg.RememberTiles,
 		RememberedShade = Cfg.RememberedShade,
 		MaxTiles = Cfg.MaxTiles,

@@ -77,6 +77,11 @@ ShadeDownsample=2
 ; 渲染时顺带产出画布版二进制 payload（协议 v1）。现在和 PNG 共用同一次区块采集，
 ; 所以只多花一点 deflate 时间；将来切到 canvas 渲染时，服务端就只剩这一步了。
 CanvasPayload=1
+; **只要画布 payload、不出 PNG**。这会跳过整个像素合成 + PNG 编码
+; （48 区块视野实测约 216 + 60 ms，是服务端唯一的大头，而且占着世界 tick 线程），
+; 服务端就只剩"拼装 + deflate"约 20 ms。需要页面用 canvas 渲染（见 [Web] UseCanvas）；
+; 浏览器不支持时会自动退回 PNG 路径。非 topo 图层也会自动退回。
+CanvasOnly=1
 
 [Cache]
 ; 是否记住“曾经加载过”的区块：每个区块只存 1280 字节的渲染快照

@@ -30,6 +30,7 @@ R.Config = {
 	-- 山体阴影降采样倍率：1 = 每像素都算，2 = 每两像素算一次（省一半推导开销）
 	ShadeDownsample = 2,
 	CanvasPayload = true,     -- 渲染时顺带产出画布版二进制 payload（协议 v1）
+	CanvasOnly = false,       -- 只要画布 payload、不出 PNG（跳过整个像素合成，省最多）
 
 	RememberTiles = true,     -- 是否记住曾经加载过的区块
 	RememberedShade = 1.0,    -- 记忆中的区块的压暗系数（1.0 = 与实时一致）
@@ -948,21 +949,27 @@ local function CollectMarkers(World, OriginX, OriginZ, Blocks)
 	end
 
 	local Count = 0
+	-- 除了画进像素的 Markers，另外给一份**坐标列表**：切到画布后标记改成
+	-- DOM 叠加层（更清晰、与缩放无关、还能带 tooltip），这几个坐标就是给它的。
+	local Spots = {}
 	World:ForEachPlayer(function (Player)
 		local Pos = Player:GetPosition()
 		if (Pos ~= nil) then
 			Plot(Pos.x, Pos.z, 230, 60, 60, 1)
 			Plot(Pos.x, Pos.z, 255, 255, 255, 0)
 			Count = Count + 1
+			Spots[#Spots + 1] = { X = floor(Pos.x), Z = floor(Pos.z), Kind = "player", Name = Player:GetName() }
 		end
 	end)
 
 	if (R.Config.DrawSpawn) then
-		Plot(World:GetSpawnX(), World:GetSpawnZ(), 70, 160, 255, 1)
-		Plot(World:GetSpawnX(), World:GetSpawnZ(), 255, 255, 255, 0)
+		local SX, SZ = World:GetSpawnX(), World:GetSpawnZ()
+		Plot(SX, SZ, 70, 160, 255, 1)
+		Plot(SX, SZ, 255, 255, 255, 0)
+		Spots[#Spots + 1] = { X = floor(SX), Z = floor(SZ), Kind = "spawn" }
 	end
 
-	return Markers, Count
+	return Markers, Count, Spots
 end
 
 -- biome 图层里没有生物群系数据时的颜色
@@ -1149,9 +1156,9 @@ function R.Render(World, Opts)
 	end
 
 	local TGrid = Clock()
-	local Markers, PlayerCount = nil, 0
+	local Markers, PlayerCount, PlayerSpots = nil, 0, {}
 	if (Cfg.DrawPlayers or Cfg.DrawSpawn) then
-		Markers, PlayerCount = CollectMarkers(World, OriginX, OriginZ, Blocks)
+		Markers, PlayerCount, PlayerSpots = CollectMarkers(World, OriginX, OriginZ, Blocks)
 	end
 
 	local TMarkers = Clock()
@@ -1182,18 +1189,12 @@ function R.Render(World, Opts)
 	-- 每批用一次 char(unpack(...))；上限 2048 是为了不撞 Lua 的 unpack 参数上限
 	local PIXEL_BATCH = 2048
 
-	local Out = {}
-	local IsBiome = (Mode == "biome")
-	local IsChunks = (Mode == "chunks")
-	local DrawGrid = Cfg.DrawChunkGrid and true or false
-	local Shading = Cfg.HillShading and (Mode == "topo") and true or false
-	-- 阴影降采样倍率（见 [Render] ShadeDownsample 的说明与实测数据）
-	local Downsample = floor(tonumber(Cfg.ShadeDownsample) or 1)
-	if (Downsample < 1) then Downsample = 1 end
-
 	-- 画布 payload（协议 v1）：数据都已经在 TileGrid / StateGrid 里了，
 	-- 这里只是"拼装 + deflate"。和 PNG 共用同一次区块采集，所以几乎不要钱；
 	-- 真正切到画布之后，服务端的渲染就只剩这一步了。
+	-- 注意这段必须放在像素阶段之前：WantPng 要按它的结果决定。
+	local DrawGrid = Cfg.DrawChunkGrid and true or false
+	local Shading = Cfg.HillShading and (Mode == "topo") and true or false
 	local BinData, BinRaw = nil, nil
 	if Cfg.CanvasPayload and (Mode == "topo") then
 		local TBin0 = Clock()
@@ -1201,190 +1202,205 @@ function R.Render(World, Opts)
 		R.Stats.PhaseBin = R.Stats.PhaseBin + (Clock() - TBin0)
 	end
 
-	-- 山体阴影要读"上一像素行"的高度，所以每行保留一份"每区块 16 字节"的高度带，
-	-- 两行轮换使用。这样阴影不用每像素去查 TileGrid、也不做除法。
-	local PrevRow, CurRow = {}, {}
+	-- 是否还要产出 PNG。切到画布之后就不需要了 —— 跳过整个像素合成 + PNG 编码
+	-- （48 区块视野实测约 216 + 60 ms，是服务端唯一的大头，而且它占着世界 tick 线程）。
+	-- 拿不到画布 payload 时（比如非 topo 图层）自动退回去出 PNG。
+	local WantPng = Opts.NoCanvas or (not (Cfg.CanvasOnly and (Mode == "topo") and (BinData ~= nil)))
+	local Png = nil
+	if WantPng then
+		local Out = {}
+		local IsBiome = (Mode == "biome")
+		local IsChunks = (Mode == "chunks")
+		-- Shading / DrawGrid 已经在上面算好了（画布 payload 也要用），这里不再重复声明
+		-- 阴影降采样倍率（见 [Render] ShadeDownsample 的说明与实测数据）
+		local Downsample = floor(tonumber(Cfg.ShadeDownsample) or 1)
+		if (Downsample < 1) then Downsample = 1 end
 
-	-- 标记按"像素行"分组一次。标记本来就很稀疏（结构 + 玩家 + 出生点，几十个），
-	-- 而像素循环有几十万次 —— 原来每像素要查两次哈希表。
-	-- 分组后每行只查一次，绝大多数行根本没有标记，于是每像素只剩一次 nil 判断。
-	-- 顺序有意为之：先结构、后玩家 / 出生点，后者压在上面。
-	local RowsMk = nil
-	if (StructMarkers ~= nil) or (Markers ~= nil) then
-		local Srcs = {}
-		if (StructMarkers ~= nil) then Srcs[#Srcs + 1] = StructMarkers end
-		if (Markers ~= nil) then Srcs[#Srcs + 1] = Markers end
-		RowsMk = {}
-		for si = 1, #Srcs do
-			for MKey, Mk in pairs(Srcs[si]) do
-				local pz = MKey % 4096
-				local px = floor(MKey / 4096)
-				local RowT = RowsMk[pz]
-				if (RowT == nil) then
-					RowT = {}
-					RowsMk[pz] = RowT
+		-- 山体阴影要读"上一像素行"的高度，所以每行保留一份"每区块 16 字节"的高度带，
+		-- 两行轮换使用。这样阴影不用每像素去查 TileGrid、也不做除法。
+		local PrevRow, CurRow = {}, {}
+
+		-- 标记按"像素行"分组一次。标记本来就很稀疏（结构 + 玩家 + 出生点，几十个），
+		-- 而像素循环有几十万次 —— 原来每像素要查两次哈希表。
+		-- 分组后每行只查一次，绝大多数行根本没有标记，于是每像素只剩一次 nil 判断。
+		-- 顺序有意为之：先结构、后玩家 / 出生点，后者压在上面。
+		local RowsMk = nil
+		if (StructMarkers ~= nil) or (Markers ~= nil) then
+			local Srcs = {}
+			if (StructMarkers ~= nil) then Srcs[#Srcs + 1] = StructMarkers end
+			if (Markers ~= nil) then Srcs[#Srcs + 1] = Markers end
+			RowsMk = {}
+			for si = 1, #Srcs do
+				for MKey, Mk in pairs(Srcs[si]) do
+					local pz = MKey % 4096
+					local px = floor(MKey / 4096)
+					local RowT = RowsMk[pz]
+					if (RowT == nil) then
+						RowT = {}
+						RowsMk[pz] = RowT
+					end
+					RowT[px] = Mk
 				end
-				RowT[px] = Mk
 			end
 		end
-	end
 
-	for bz = 0, Blocks - 1 do
-		local RowChunk = floor(bz / 16)
-		local ty = bz % 16
-		local RowChunkBase = RowChunk * SizeChunks
-		local Row, Buf, Bn = {}, {}, 0
-		local RowMk = (RowsMk ~= nil) and RowsMk[bz] or nil
-		-- 山体阴影的降采样状态（每行重置）：见下面阴影段的说明
-		local ShadeReuse, CurShade = 0, nil
-		PrevRow, CurRow = CurRow, PrevRow
+		for bz = 0, Blocks - 1 do
+			local RowChunk = floor(bz / 16)
+			local ty = bz % 16
+			local RowChunkBase = RowChunk * SizeChunks
+			local Row, Buf, Bn = {}, {}, 0
+			local RowMk = (RowsMk ~= nil) and RowsMk[bz] or nil
+			-- 山体阴影的降采样状态（每行重置）：见下面阴影段的说明
+			local ShadeReuse, CurShade = 0, nil
+			PrevRow, CurRow = CurRow, PrevRow
 
-		-- bx/16 与 bx%16 用递增计数器代替（原来是每像素两次除法 + 两次取模）；
-		-- 顺带在区块边界处把该区块的 Tile / State / 当前行高度带一次取好。
-		local cx, tx = -1, 15
-		local gi, Tile, State, CurBand = 0, nil, 0, nil
+			-- bx/16 与 bx%16 用递增计数器代替（原来是每像素两次除法 + 两次取模）；
+			-- 顺带在区块边界处把该区块的 Tile / State / 当前行高度带一次取好。
+			local cx, tx = -1, 15
+			local gi, Tile, State, CurBand = 0, nil, 0, nil
 
-		for bx = 0, Blocks - 1 do
-			local Cr, Cg, Cb
+			for bx = 0, Blocks - 1 do
+				local Cr, Cg, Cb
 
-			tx = tx + 1
-			if (tx == 16) then
-				tx = 0
-				cx = cx + 1
-				gi = RowChunkBase + cx + 1
-				Tile = TileGrid[gi]
-				State = StateGrid[gi] or 0
-				if Shading and (State ~= 0) and (Tile ~= nil) then
-					-- 一次取 16 列高度（原来是每像素一次 Tile:byte）。
-					-- 注意必须用 sub 而不是 byte：string.byte(s, i, j) 返回的是
-					-- **j-i+1 个值**，赋给一个变量只会拿到第一个字节的数字。
-					CurBand = Tile:sub(TILE_COLORS + ty * 16 + 1, TILE_COLORS + ty * 16 + 16)
-				else
-					CurBand = nil
-				end
-				CurRow[cx + 1] = CurBand
-			end
-
-			if IsBiome then
-				local BG = BiomeGrid[gi]
-				local B = 0
-				if (BG ~= nil) then
-					B = BG:byte(ty * 16 + tx + 1) or 0
-				end
-				if (B == 0) then
-					Cr, Cg, Cb = NoBiomeColor[1], NoBiomeColor[2], NoBiomeColor[3]
-				else
-					local Biome = B - 1
-					local C = WCM_Blocks.Biomes[Biome]
-					if (C == nil) then
-						C = WCM_Blocks.AutoColor(Biome)
+				tx = tx + 1
+				if (tx == 16) then
+					tx = 0
+					cx = cx + 1
+					gi = RowChunkBase + cx + 1
+					Tile = TileGrid[gi]
+					State = StateGrid[gi] or 0
+					if Shading and (State ~= 0) and (Tile ~= nil) then
+						-- 一次取 16 列高度（原来是每像素一次 Tile:byte）。
+						-- 注意必须用 sub 而不是 byte：string.byte(s, i, j) 返回的是
+						-- **j-i+1 个值**，赋给一个变量只会拿到第一个字节的数字。
+						CurBand = Tile:sub(TILE_COLORS + ty * 16 + 1, TILE_COLORS + ty * 16 + 16)
+					else
+						CurBand = nil
 					end
-					Cr, Cg, Cb = C[1], C[2], C[3]
+					CurRow[cx + 1] = CurBand
 				end
-			else
-				if IsChunks then
-					local C = StateColors[State]
-					Cr, Cg, Cb = C[1], C[2], C[3]
-				else
-					local ti = (ty * 16 + tx) * 3 + 1
-					Cr, Cg, Cb = Tile:byte(ti, ti + 2)
 
-					-- 山体阴影：向西北邻居取高度，跨区块连续。
-					-- 高度已在区块边界按行预取好（CurBand / PrevRow），所以这里
-					-- 既不查 TileGrid 也不做除法；明暗系数查表。
-					-- 注意 PrevRow 里可能没有这一格（那个区块当时没有快照）——
-					-- 对应老代码里 nt == nil 的情况，跳过即可。
-					-- 山体阴影。
-					--
-					-- 降采样：阴影是低频场，所以**每两个像素才算一次明暗系数**，中间那个
-					-- 直接复用。误差只是"阴影边界横移一个方块"，肉眼看不出来，
-					-- 省下的是每像素两次字符串取字节 + 比较 + 夹取（那才是这里的大头，
-					-- 因为 Lua 里字符串取字节是 C 调用）。
-					--
-					-- 只在真正算过之后才设复用计数：bx == 0（左边越界）不算，
-					-- 于是下个像素会自己算，不会把"无阴影"错误地传播出去。
-					if (ShadeReuse > 0) then
-						ShadeReuse = ShadeReuse - 1
-					elseif Shading and (bx > 0) and (bz > 0) and (State ~= 0) then
-						local There
-						if (tx > 0) then
-							local PB = PrevRow[cx + 1]
-							There = (PB ~= nil) and PB:byte(tx) or nil
-						else
-							local PB = PrevRow[cx]
-							There = (PB ~= nil) and PB:byte(16) or nil
+				if IsBiome then
+					local BG = BiomeGrid[gi]
+					local B = 0
+					if (BG ~= nil) then
+						B = BG:byte(ty * 16 + tx + 1) or 0
+					end
+					if (B == 0) then
+						Cr, Cg, Cb = NoBiomeColor[1], NoBiomeColor[2], NoBiomeColor[3]
+					else
+						local Biome = B - 1
+						local C = WCM_Blocks.Biomes[Biome]
+						if (C == nil) then
+							C = WCM_Blocks.AutoColor(Biome)
 						end
-						local Here = CurBand:byte(tx + 1)
-						CurShade = nil
-						if (Here ~= nil) and (There ~= nil) and (Here > 0) and (There > 0) then
-							local D = Here - There
-							-- D == 0 时 F 恰好是 1 —— 平坦地形（海、平原）走这条捷径
-							if (D ~= 0) then
-								if (D > 8) then D = 8 elseif (D < -8) then D = -8 end
-								CurShade = ShadeTab[D + 8]
+						Cr, Cg, Cb = C[1], C[2], C[3]
+					end
+				else
+					if IsChunks then
+						local C = StateColors[State]
+						Cr, Cg, Cb = C[1], C[2], C[3]
+					else
+						local ti = (ty * 16 + tx) * 3 + 1
+						Cr, Cg, Cb = Tile:byte(ti, ti + 2)
+
+						-- 山体阴影：向西北邻居取高度，跨区块连续。
+						-- 高度已在区块边界按行预取好（CurBand / PrevRow），所以这里
+						-- 既不查 TileGrid 也不做除法；明暗系数查表。
+						-- 注意 PrevRow 里可能没有这一格（那个区块当时没有快照）——
+						-- 对应老代码里 nt == nil 的情况，跳过即可。
+						-- 山体阴影。
+						--
+						-- 降采样：阴影是低频场，所以**每两个像素才算一次明暗系数**，中间那个
+						-- 直接复用。误差只是"阴影边界横移一个方块"，肉眼看不出来，
+						-- 省下的是每像素两次字符串取字节 + 比较 + 夹取（那才是这里的大头，
+						-- 因为 Lua 里字符串取字节是 C 调用）。
+						--
+						-- 只在真正算过之后才设复用计数：bx == 0（左边越界）不算，
+						-- 于是下个像素会自己算，不会把"无阴影"错误地传播出去。
+						if (ShadeReuse > 0) then
+							ShadeReuse = ShadeReuse - 1
+						elseif Shading and (bx > 0) and (bz > 0) and (State ~= 0) then
+							local There
+							if (tx > 0) then
+								local PB = PrevRow[cx + 1]
+								There = (PB ~= nil) and PB:byte(tx) or nil
+							else
+								local PB = PrevRow[cx]
+								There = (PB ~= nil) and PB:byte(16) or nil
 							end
+							local Here = CurBand:byte(tx + 1)
+							CurShade = nil
+							if (Here ~= nil) and (There ~= nil) and (Here > 0) and (There > 0) then
+								local D = Here - There
+								-- D == 0 时 F 恰好是 1 —— 平坦地形（海、平原）走这条捷径
+								if (D ~= 0) then
+									if (D > 8) then D = 8 elseif (D < -8) then D = -8 end
+									CurShade = ShadeTab[D + 8]
+								end
+							end
+							ShadeReuse = Downsample - 1
 						end
-						ShadeReuse = Downsample - 1
-					end
-					if (CurShade ~= nil) then
-						Cr = CurShade[Cr]
-						Cg = CurShade[Cg]
-						Cb = CurShade[Cb]
-					end
+						if (CurShade ~= nil) then
+							Cr = CurShade[Cr]
+							Cg = CurShade[Cg]
+							Cb = CurShade[Cb]
+						end
 
-					if (State == 1) and (Shade ~= 1) then
-						Cr = floor(Cr * Shade)
-						Cg = floor(Cg * Shade)
-						Cb = floor(Cb * Shade)
+						if (State == 1) and (Shade ~= 1) then
+							Cr = floor(Cr * Shade)
+							Cg = floor(Cg * Shade)
+							Cb = floor(Cb * Shade)
+						end
 					end
 				end
-			end
 
-			-- 区块边界
-			if (DrawGrid and ((tx == 0) or (ty == 0))) then
-				Cr = floor(Cr * GridFactor)
-				Cg = floor(Cg * GridFactor)
-				Cb = floor(Cb * GridFactor)
-			end
+				-- 区块边界
+				if (DrawGrid and ((tx == 0) or (ty == 0))) then
+					Cr = floor(Cr * GridFactor)
+					Cg = floor(Cg * GridFactor)
+					Cb = floor(Cb * GridFactor)
+				end
 
-			-- 标记（结构和玩家 / 出生点已经按行合并好了，见上面的 RowsMk）
-			if (RowMk ~= nil) then
-				local Mk = RowMk[bx]
-				if (Mk ~= nil) then
-					Cr, Cg, Cb = Mk[1], Mk[2], Mk[3]
+				-- 标记（结构和玩家 / 出生点已经按行合并好了，见上面的 RowsMk）
+				if (RowMk ~= nil) then
+					local Mk = RowMk[bx]
+					if (Mk ~= nil) then
+						Cr, Cg, Cb = Mk[1], Mk[2], Mk[3]
+					end
+				end
+
+				if (Cr > 255) then Cr = 255 elseif (Cr < 0) then Cr = 0 end
+				if (Cg > 255) then Cg = 255 elseif (Cg < 0) then Cg = 0 end
+				if (Cb > 255) then Cb = 255 elseif (Cb < 0) then Cb = 0 end
+
+				-- 数字缓冲 + char(unpack(...)) 分批：原来每个格子是 char() 加 :rep()
+				-- 两次分配，大视野下就是百万级可回收对象。表里放数字不进 GC。
+				Bn = Bn + 1; Buf[Bn] = Cr
+				Bn = Bn + 1; Buf[Bn] = Cg
+				Bn = Bn + 1; Buf[Bn] = Cb
+				if (Bn >= PIXEL_BATCH) then
+					Row[#Row + 1] = char(unpack(Buf, 1, Bn))
+					Bn = 0
 				end
 			end
-
-			if (Cr > 255) then Cr = 255 elseif (Cr < 0) then Cr = 0 end
-			if (Cg > 255) then Cg = 255 elseif (Cg < 0) then Cg = 0 end
-			if (Cb > 255) then Cb = 255 elseif (Cb < 0) then Cb = 0 end
-
-			-- 数字缓冲 + char(unpack(...)) 分批：原来每个格子是 char() 加 :rep()
-			-- 两次分配，大视野下就是百万级可回收对象。表里放数字不进 GC。
-			Bn = Bn + 1; Buf[Bn] = Cr
-			Bn = Bn + 1; Buf[Bn] = Cg
-			Bn = Bn + 1; Buf[Bn] = Cb
-			if (Bn >= PIXEL_BATCH) then
+			if (Bn > 0) then
 				Row[#Row + 1] = char(unpack(Buf, 1, Bn))
-				Bn = 0
 			end
-		end
-		if (Bn > 0) then
-			Row[#Row + 1] = char(unpack(Buf, 1, Bn))
+
+			Out[#Out + 1] = concat(Row)
 		end
 
-		Out[#Out + 1] = concat(Row)
+		local Pixels = concat(Out)
+		local TPixels = Clock()
+		Png = WCM_Png.Encode(ImgSize, ImgSize, Pixels, Cfg.PngFactor, Cfg.PngFilter)
+		local TPng = Clock()
+		R.Stats.PhaseGrid = R.Stats.PhaseGrid + (TGrid - T0)
+		R.Stats.PhaseMarkers = R.Stats.PhaseMarkers + (TMarkers - TGrid)
+		R.Stats.PhaseStruct = R.Stats.PhaseStruct + (TStruct - TMarkers)
+		R.Stats.PhasePixels = R.Stats.PhasePixels + (TPixels - TStruct)
+		R.Stats.PhasePng = R.Stats.PhasePng + (TPng - TPixels)
 	end
-
-	local Pixels = concat(Out)
-	local TPixels = Clock()
-	local Png = WCM_Png.Encode(ImgSize, ImgSize, Pixels, Cfg.PngFactor, Cfg.PngFilter)
-	local TPng = Clock()
-	R.Stats.PhaseGrid = R.Stats.PhaseGrid + (TGrid - T0)
-	R.Stats.PhaseMarkers = R.Stats.PhaseMarkers + (TMarkers - TGrid)
-	R.Stats.PhaseStruct = R.Stats.PhaseStruct + (TStruct - TMarkers)
-	R.Stats.PhasePixels = R.Stats.PhasePixels + (TPixels - TStruct)
-	R.Stats.PhasePng = R.Stats.PhasePng + (TPng - TPixels)
 
 	local Meta = {
 		WorldName = WorldName,
@@ -1401,6 +1417,7 @@ function R.Render(World, Opts)
 		ImgWidth = ImgSize,          -- PNG 的真实像素
 		ImgHeight = ImgSize,
 		Players = PlayerCount,
+		PlayerSpots = PlayerSpots,
 		Structures = Structures,
 		OriginChunkX = BaseCX,
 		OriginChunkZ = BaseCZ,
@@ -1421,7 +1438,7 @@ function R.Render(World, Opts)
 		LoadedChunks = World:GetNumChunks(),
 		CacheHit = false,
 		RenderMs = floor((Clock() - T0) * 1000),
-		PngBytes = #Png,
+		PngBytes = ((Png ~= nil) and #Png or 0),
 	}
 
 	R.Stats.Renders = R.Stats.Renders + 1
@@ -1497,6 +1514,10 @@ function R.Plan(Opts, SpawnX, SpawnZ)
 		end
 	end
 
+	-- ?canvas=0 时强制走 PNG 路径（浏览器画不了 canvas 时的退路）。
+	-- 它进缓存键，所以两种形态各自缓存，不会互相污染。
+	local NoCanvas = (Opts.NoCanvas == true)
+
 	local Mode = Opts.Mode or "topo"
 	if ((Mode ~= "topo") and (Mode ~= "biome") and (Mode ~= "chunks")) then
 		Mode = "topo"
@@ -1514,6 +1535,7 @@ function R.Plan(Opts, SpawnX, SpawnZ)
 		RequestedSizeChunks = RequestedSize,
 		SizeClamped = (SizeChunks ~= RequestedSize),
 		Scale = Scale,
+		NoCanvas = NoCanvas,
 		Blocks = Blocks,
 		-- Width/Height 是**显示**尺寸：web.lua 用它排叠加层和算点击坐标。
 		Width = Blocks * Scale,
@@ -1537,6 +1559,7 @@ end
 function R.PlanKey(WorldName, Plan)
 	return concat({
 		WorldName, Plan.Mode, Plan.OriginX, Plan.OriginZ, Plan.SizeChunks, Plan.Scale,
+		Plan.NoCanvas and "n" or "-",
 		R.Config.HillShading and "h" or "-",
 		R.Config.DrawChunkGrid and "g" or "-",
 		R.Config.DrawPlayers and "p" or "-",

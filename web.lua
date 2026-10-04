@@ -351,6 +351,7 @@ local PAGE_CSS = [[
 <style>
 .wcm-map { position: relative; display: inline-block; line-height: 0; border: 1px solid #CCDDD9; background: #fff; }
 .wcm-map img { display: block; image-rendering: pixelated; }
+.wcm-map canvas { display: block; image-rendering: pixelated; }
 .wcm-pending { display: flex; align-items: center; justify-content: center; color: #888;
 	background: #F4F7F6; font-size: 13px; }
 .wcm-sel { position: absolute; box-sizing: border-box; border: 2px solid #c14544; pointer-events: none; }
@@ -396,7 +397,25 @@ local function SyntheticMeta(Plan, WInfo, WorldName)
 	}
 end
 
-local function BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, InfoStale, QueuedRender)
+--- 画布引导：把 payload 画到 canvas 上；浏览器不支持就显示回退链接。
+--- 单引号字符串里不能再出现单引号，所以用 [[ ]]。
+local CANVAS_BOOT = [[
+function WCMCanvas_mount(B64) {
+  var C = document.getElementById('wcm-canvas');
+  var F = document.getElementById('wcm-canvas-fallback');
+  function fail(M) {
+    if (C) { C.style.display = 'none'; }
+    if (F) { F.style.display = 'block'; if (M) { F.textContent = M; } }
+  }
+  if (!C || !window.WCMCanvas) { fail(); return; }
+  if (typeof DecompressionStream === 'undefined') { fail('浏览器不支持 DecompressionStream。'); return; }
+  WCMCanvas.draw(C, WCMCanvas.b64ToBytes(B64)).then(function (R) {
+    window.WCM_CANVAS_MS = R.TotalMs;
+  }).catch(function (e) { fail('画布渲染失败：' + e); });
+}
+]]
+
+local function BuildPage(Request, P, WInfo, Meta, Png, Bin, Notice, RefreshDelay, InfoStale, QueuedRender)
 	local Path = RequestPath(Request)
 	local Base = Path .. "?"
 	local _, SelList = ParseSelection(P.sel)
@@ -495,7 +514,21 @@ local function BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, Inf
 	local Clickable = (Meta.Mode ~= "biome") and ((Meta.SizeChunks * Meta.SizeChunks) <= W.MaxClickableChunks)
 
 	A("<div class='wcm-map'>")
-	if (Png ~= nil) then
+	-- 优先画布：服务端只发"预打包调色板 + 高度 + 状态"，逐像素的合成在浏览器里做。
+	-- 画布的内在尺寸就是**方块分辨率**（Meta.ImgWidth），CSS 放大到显示尺寸，
+	-- image-rendering: pixelated 保证是最近邻 —— 和服务端复制像素完全等价。
+	local UseCanvas = W.UseCanvas and (Bin ~= nil) and (W.CanvasJs ~= nil) and (Meta.Mode == "topo")
+	if UseCanvas then
+		local ImgW = Meta.ImgWidth or Meta.Width
+		A("<canvas id='wcm-canvas' width='" .. ImgW .. "' height='" .. ImgW
+			.. "' style='width:" .. Meta.Width .. "px;height:" .. Meta.Height .. "px'></canvas>")
+		A("<script>" .. W.CanvasJs .. "</script>")
+		A("<script>" .. CANVAS_BOOT .. "</script>")
+		A("<script>WCMCanvas_mount('" .. Base64Encode(Bin) .. "');</script>")
+		A("<div id='wcm-canvas-fallback' style='display:none;padding:8px;color:#a00;line-height:1.5'>"
+			.. "这个浏览器画不了 canvas（或渲染失败）。<a href='"
+			.. Esc(Base .. QueryString(P, "canvas=0")) .. "'>改用服务端 PNG</a>。</div>")
+	elseif (Png ~= nil) then
 		local ImgSrc
 		if W.InlineImages then
 			ImgSrc = "data:image/png;base64," .. Base64Encode(Png)
@@ -688,18 +721,25 @@ function W.HandleRequest(Request, UrlPath)
 	local SelRaw = Param(Request, "sel") or ""
 	local _, SelList = ParseSelection(SelRaw)
 
+	local WantPng = (Param(Request, "canvas") == "0") or ((Param(Request, "format") or "html") == "png")
+
 	local Opts = {
 		Mode = Mode,
 		SizeChunks = IntParam(Request, "size", W.DefaultSize, 1, WCM_Render.Config.MaxSizeChunks),
 		Scale = IntParam(Request, "scale", W.DefaultScale, 1, 4),
 		CenterX = IntParam(Request, "cx", WInfo.SpawnX, -30000000, 30000000),
 		CenterZ = IntParam(Request, "cz", WInfo.SpawnZ, -30000000, 30000000),
+		-- 需要服务端 PNG 的两种情形：明确 ?canvas=0（浏览器画不了 canvas 的退路），
+		-- 或者要拿裸 PNG（?format=png）。其余情况走画布。
+		NoCanvas = WantPng,
 	}
 
 	-- 纯计算：几何参数 + 缓存键，都不碰世界数据
 	local Plan = WCM_Render.Plan(Opts, WInfo.SpawnX, WInfo.SpawnZ)
 	local CacheKey = WCM_Render.PlanKey(WorldName, Plan)
 	local Png, Meta, Age = WCM_Render.GetCached(CacheKey)
+	-- 画布 payload（HTTP 线程安全：只读纯 Lua 缓存）
+	local Bin = WCM_Render.GetCachedBin(CacheKey)
 	local NoCache = (Param(Request, "nocache") == "1")
 
 	--------------------------------------------------------------------
@@ -840,15 +880,17 @@ function W.HandleRequest(Request, UrlPath)
 	--------------------------------------------------------------------
 	-- TTL 只决定"要不要在后台更新缓存"，绝不决定"这次请求能不能用缓存"。
 	-- 命中但过期的图照旧先发出去（stale-while-revalidate）：页面不阻塞、不跳转。
-	local ImageStale = (Png ~= nil) and (Age > WCM_Render.Config.CacheTTL)
+	-- 画布模式下缓存里没有 PNG、只有 payload，所以"有东西可显示"要两个都看
+	local HaveImage = (Png ~= nil) or (Bin ~= nil)
+	local ImageStale = HaveImage and (Age > WCM_Render.Config.CacheTTL)
 	local QueuedRender = false
-	if (Png == nil) or ImageStale or NoCache then
+	if (not HaveImage) or ImageStale or NoCache then
 		WCM_Render.Enqueue({
 			Kind = "render", WorldName = WorldName,
 			Opts = {
 				Mode = Plan.Mode, SizeChunks = Plan.SizeChunks, Scale = Plan.Scale,
 				CenterX = Plan.CenterX, CenterZ = Plan.CenterZ,
-				NoCache = NoCache,
+				NoCache = NoCache, NoCanvas = WantPng,
 			},
 		})
 		QueuedRender = true
@@ -885,7 +927,7 @@ function W.HandleRequest(Request, UrlPath)
 	-- 选中区块的详情走 ?panel=1 局部 fetch，绝不整页重载 ——
 	-- 整页重载会在用户点下一个区块时打乱页面，点击落到已选区块上就变成了"取消"。
 	local RefreshDelay = nil
-	if (Png == nil) or NoCache or ActionQueued then
+	if (not HaveImage) or NoCache or ActionQueued then
 		RefreshDelay = W.RenderRefresh
 	end
 
@@ -895,5 +937,5 @@ function W.HandleRequest(Request, UrlPath)
 		return BuildSelectionPanel(PanelPath, PanelPath .. "?", P, WInfo, SelList), "text/html"
 	end
 
-	return BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, InfoStale, QueuedRender), "text/html"
+	return BuildPage(Request, P, WInfo, Meta, Png, Bin, Notice, RefreshDelay, InfoStale, QueuedRender), "text/html"
 end
