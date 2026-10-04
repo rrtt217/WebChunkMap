@@ -60,6 +60,7 @@ local function ReadSettings(Folder)
 		PngFactor     = Ini:GetValueSetI("Render", "PngCompression", 6),
 		PngFilter     = Ini:GetValueSet("Render", "PngFilter", "none"),
 		ShadeDownsample = Ini:GetValueSetI("Render", "ShadeDownsample", 2),
+		CanvasPayload = Ini:GetValueSetI("Render", "CanvasPayload", 1),
 
 		RememberTiles    = Ini:GetValueSetB("Cache", "RememberChunks", true),
 		RememberedShade  = Ini:GetValueSetF("Cache", "RememberedShade", 1.0),
@@ -266,6 +267,7 @@ function Initialize(Plugin)
 		PngFactor = Cfg.PngFactor,
 		PngFilter = Cfg.PngFilter,
 		ShadeDownsample = Cfg.ShadeDownsample,
+		CanvasPayload = (Cfg.CanvasPayload ~= 0),
 		RememberTiles = Cfg.RememberTiles,
 		RememberedShade = Cfg.RememberedShade,
 		MaxTiles = Cfg.MaxTiles,

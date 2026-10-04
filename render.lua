@@ -29,6 +29,7 @@ R.Config = {
 	PngFilter = "none",
 	-- 山体阴影降采样倍率：1 = 每像素都算，2 = 每两像素算一次（省一半推导开销）
 	ShadeDownsample = 2,
+	CanvasPayload = true,     -- 渲染时顺带产出画布版二进制 payload（协议 v1）
 
 	RememberTiles = true,     -- 是否记住曾经加载过的区块
 	RememberedShade = 1.0,    -- 记忆中的区块的压暗系数（1.0 = 与实时一致）
@@ -60,7 +61,7 @@ R.LastSave = 0
 R.PluginFolder = nil
 R.Stats = { Renders = 0, CacheHits = 0, LiveTiles = 0, ReusedTiles = 0, LastRenderMs = 0, TileBuilds = 0,
 	-- 分阶段 CPU 时间累计（秒），配合 WebChunkMap_ProfDump() 看各阶段占比
-	PhaseGrid = 0, PhaseMarkers = 0, PhaseStruct = 0, PhasePixels = 0, PhasePng = 0 }
+	PhaseGrid = 0, PhaseMarkers = 0, PhaseStruct = 0, PhasePixels = 0, PhasePng = 0, PhaseBin = 0 }
 
 local TILE_COLORS  = 768    -- 16 * 16 * 3  顶面颜色
 local TILE_HEIGHTS = 256    -- 16 * 16      地表高度（h+1，0 = 未知）
@@ -974,6 +975,69 @@ local StateColors = {
 	[2] = { 96, 160, 82 },    -- 当前已加载
 }
 
+--- 画布协议的头部长度与版本（格式见 AGENTS.md 第 4 节"画布协议"）
+-- 头部字节数。注意 gridFactor / rememberedShade 用 **u16 存 4 位小数**（F*10000），
+-- 不能存成一个字节：那会引入 0.16% 的量化误差，让网格线的 floor(Cr*F) 和
+-- 服务端差 1 —— 实测就这一个精度问题造成了 4.4 万个像素不一致。
+local BIN_HEADER = 25
+local BIN_VERSION = 1
+local GRID_FACTOR = 0.74      -- 区块网格线的压暗系数（和 PNG 路径保持一致）
+
+--- 从渲染时**已经采集好的网格**组装画布 payload（协议 v1，只管 topo 图层）。
+---
+--- 刻意不碰 cWorld：TileGrid / StateGrid 里已经有全部所需数据
+--- （预打包的调色板段 + 高度 + 状态），所以这里只是"拼接 + deflate"。
+--- 逐像素的颜色展开、山体阴影、区块网格线、标记**全部留给浏览器** ——
+--- 那才是这次迁移要搬走的东西（服务端 ~200 ms -> ~20 ms，而且离开 tick 线程）。
+---
+--- 每个区块的记录：
+---     state(1) + 调色板段(177，原样拷) + 高度(256，仅 topo 且开阴影时)
+--- state == 0 的未知区块只占 **1 字节**（颜色从头部取）。服务端的阴影本来就只对
+--- state ~= 0 的区块生效，所以丢掉那些高度不会有任何损失。
+local function BuildBinaryFromGrid(Plan, TileGrid, StateGrid, Cfg, Shading, DrawGrid)
+	local SizeChunks = Plan.SizeChunks
+	local Buf = {}
+
+	Buf[#Buf + 1] = "WCMB"
+	Buf[#Buf + 1] = PackU16(BIN_VERSION)
+	Buf[#Buf + 1] = char(0, (Shading and 1 or 0) + (DrawGrid and 2 or 0))   -- mode, flags
+	Buf[#Buf + 1] = PackI32(Plan.OriginChunkX)
+	Buf[#Buf + 1] = PackI32(Plan.OriginChunkZ)
+	Buf[#Buf + 1] = PackU16(SizeChunks)
+	Buf[#Buf + 1] = PackU16(floor(GRID_FACTOR * 10000 + 0.5) % 65536)
+	Buf[#Buf + 1] = PackU16(floor((tonumber(Cfg.RememberedShade) or 1) * 10000 + 0.5) % 65536)
+	Buf[#Buf + 1] = R.UnknownTile():sub(1, 3)   -- 未知区块的占位色
+
+	for cz = 0, SizeChunks - 1 do
+		for cx = 0, SizeChunks - 1 do
+			local gi = cz * SizeChunks + cx + 1
+			local State = StateGrid[gi] or 0
+			local Tile = TileGrid[gi]
+			Buf[#Buf + 1] = char(State)
+			if (State ~= 0) and (Tile ~= nil) then
+				-- 快照里那 177 字节正好就是线上格式，原样拷（补零由 deflate 吃掉）
+				Buf[#Buf + 1] = Tile:sub(OFF_PALCOUNT + 1, TILE_SIZE)
+				if Shading then
+					Buf[#Buf + 1] = Tile:sub(TILE_COLORS + 1, TILE_COLORS + TILE_HEIGHTS)
+				end
+			end
+		end
+	end
+
+	local Raw = concat(Buf)
+	return cStringCompression.CompressStringZLIB(Raw, Cfg.PngFactor), Raw
+end
+
+--- 取画布 payload（HTTP 线程安全：只读纯 Lua 缓存，绝不碰 cWorld）。
+--- 返回 (Data, Meta, RawBytes)；没有缓存时返回 nil。
+function R.GetCachedBin(Key)
+	local Cached = R.Cache[Key]
+	if (Cached == nil) or (Cached.Bin == nil) then
+		return nil, nil, 0
+	end
+	return Cached.Bin, Cached.Meta, Cached.BinRawBytes
+end
+
 --- 渲染一块区域。
 -- @param World cWorld
 -- @param Opts  { Mode, SizeChunks, Scale, CenterX, CenterZ, NoCache }
@@ -1126,6 +1190,16 @@ function R.Render(World, Opts)
 	-- 阴影降采样倍率（见 [Render] ShadeDownsample 的说明与实测数据）
 	local Downsample = floor(tonumber(Cfg.ShadeDownsample) or 1)
 	if (Downsample < 1) then Downsample = 1 end
+
+	-- 画布 payload（协议 v1）：数据都已经在 TileGrid / StateGrid 里了，
+	-- 这里只是"拼装 + deflate"。和 PNG 共用同一次区块采集，所以几乎不要钱；
+	-- 真正切到画布之后，服务端的渲染就只剩这一步了。
+	local BinData, BinRaw = nil, nil
+	if Cfg.CanvasPayload and (Mode == "topo") then
+		local TBin0 = Clock()
+		BinData, BinRaw = BuildBinaryFromGrid(Plan, TileGrid, StateGrid, Cfg, Shading, DrawGrid)
+		R.Stats.PhaseBin = R.Stats.PhaseBin + (Clock() - TBin0)
+	end
 
 	-- 山体阴影要读"上一像素行"的高度，所以每行保留一份"每区块 16 字节"的高度带，
 	-- 两行轮换使用。这样阴影不用每像素去查 TileGrid、也不做除法。
@@ -1353,7 +1427,8 @@ function R.Render(World, Opts)
 	R.Stats.Renders = R.Stats.Renders + 1
 	R.Stats.LastRenderMs = Meta.RenderMs
 
-	R.Cache[Key] = { Time = Time, Png = Png, Meta = Meta }
+	R.Cache[Key] = { Time = Time, Png = Png, Meta = Meta,
+		Bin = BinData, BinRawBytes = ((BinRaw ~= nil) and #BinRaw or 0) }
 
 	-- 同一个视图重绘时 Key 会第二次入队，必须先摘掉旧的那条。
 	-- 否则淘汰弹出旧条目时 R.Cache[Old] = nil 会把**当前还有效的缓存图**删掉
@@ -1988,7 +2063,48 @@ end
 --- 跑在 MCPServer 的 Lua 状态里，CallPlugin 也只能调对方导出的函数。
 --- 所以"哪些表在涨"只能靠读代码推算；有了这个出口就能直接看数。
 ---
--- luacheck: ignore WebChunkMap_SelfCheck WebChunkMap_ProfDump WebChunkMap_ProfReset WebChunkMap_MemStats
+-- luacheck: ignore WebChunkMap_SelfCheck WebChunkMap_BinDump WebChunkMap_ProfDump
+-- luacheck: ignore WebChunkMap_ProfReset WebChunkMap_MemStats
+--- 【迁移期测试】把缓存里最新一份画布 payload 落盘，返回它的元信息。
+--- 只读缓存、不碰 cWorld，所以从 MCP 线程调用是安全的（铁律一）。
+--- 写两个文件：deflate 后的（线上就是这个）和解压后的原始字节，供外部解码验证。
+function WebChunkMap_BinDump()
+	local Best, BestTime, BestKey = nil, nil, nil
+	for Key, Cached in pairs(R.Cache) do
+		if (Cached.Bin ~= nil) and ((BestTime == nil) or (Cached.Time > BestTime)) then
+			Best, BestTime, BestKey = Cached, Cached.Time, Key
+		end
+	end
+	if (Best == nil) then
+		return { Ok = false, Error = "缓存里还没有画布 payload（先请求一次地图）" }
+	end
+	local Folder = R.PluginFolder or "."
+	local F = io.open(Folder .. "/cache/last_bin.bin", "wb")
+	if (F ~= nil) then
+		F:write(Best.Bin)
+		F:close()
+	end
+	local Raw = nil
+	local OkZ, Un = pcall(cStringCompression.DecompressStringZLIB, Best.Bin, #Best.Bin + 65536)
+	if OkZ then
+		Raw = Un
+		local F2 = io.open(Folder .. "/cache/last_bin_raw.bin", "wb")
+		if (F2 ~= nil) then
+			F2:write(Raw)
+			F2:close()
+		end
+	end
+	return {
+		Ok = true,
+		Key = BestKey,
+		Header = BIN_HEADER,
+		CompressedBytes = #Best.Bin,
+		RawBytes = (Raw ~= nil) and #Raw or -1,
+		StoredRaw = Best.BinRawBytes,
+		Meta = Best.Meta,
+	}
+end
+
 --- 自检：验证每个快照的"调色板形式"能不能无损还原出 RGB 段。
 --- 迁移期间用（确认 v2->v3 的升级没有写坏颜色），结果是个纯值表，跨插件可读。
 function WebChunkMap_SelfCheck()
