@@ -10,3 +10,4 @@ cache/*.tmp
 *.html
 *.b64
 .playwright-mcp/
+docs/canvas-test.html
