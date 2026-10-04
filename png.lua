@@ -11,6 +11,7 @@ local floor = math.floor
 local char  = string.char
 
 local XorByte      -- [a * 256 + b] = a XOR b
+local CrcT0, CrcT1, CrcT2, CrcT3   -- CRC 表的四个字节平面（见 Crc32）
 local CrcTable     -- [n] = CRC32 表项
 local TablesReady = false
 
@@ -66,25 +67,47 @@ local function EnsureTables()
 		CrcTable[n] = C
 	end
 
+	-- 把 CRC 表的四个字节平面拆成四张独立小表。
+	-- 用途见 Crc32：把 32 位异或按字节平面展开，就不用再调 Xor32 了。
+	CrcT0, CrcT1, CrcT2, CrcT3 = {}, {}, {}, {}
+	for n = 0, 255 do
+		local V = CrcTable[n]
+		CrcT0[n] = V % 256
+		CrcT1[n] = floor(V / 256) % 256
+		CrcT2[n] = floor(V / 65536) % 256
+		CrcT3[n] = floor(V / 16777216) % 256
+	end
+
 	TablesReady = true
 end
 
---- 32 位异或（操作数在 0 .. 2^32-1 之间）。
-local function Xor32(A, B)
-	return XorByte[(floor(A / 16777216) % 256) * 256 + (floor(B / 16777216) % 256)] * 16777216
-	     + XorByte[(floor(A / 65536) % 256) * 256 + (floor(B / 65536) % 256)] * 65536
-	     + XorByte[(floor(A / 256) % 256) * 256 + (floor(B / 256) % 256)] * 256
-	     + XorByte[(A % 256) * 256 + (B % 256)]
-end
-
 --- CRC32（PNG 每个 chunk 的校验和）。
+---
+--- 为什么把状态拆成四个字节变量（b0 是最低位）：
+--- Lua 5.1 没有位运算，32 位异或只能靠查表按字节平面做（见 Xor32）。
+--- 原来的写法每字节要调两次 Xor32，每次 4 次查表 + 二十来条 floor/mod/mul/add，
+--- 所以 227 KiB 的 IDAT 要花约 100 ms —— 这才是 PNG 编码真正的大头
+--- （ZLIB 是原生 C++，只占 3 ms）。
+---
+--- CRC 的位级更新式是  crc = (crc >> 8) ^ CrcTable[(crc & 0xFF) ^ byte]，
+--- 而 crc>>8 恰好就是把最低字节丢掉、b1..b3 顺移一格。逐平面展开后：
+---     b0' = b1 ^ T0[Idx]
+---     b1' = b2 ^ T1[Idx]
+---     b2' = b3 ^ T2[Idx]
+---     b3' = 0  ^ T3[Idx]
+--- 于是每字节只剩 8 次查表和 5 条算术（乘 256 就是左移一个字节）。
 local function Crc32(Data)
-	local Crc = 4294967295  -- 0xFFFFFFFF
+	local b0, b1, b2, b3 = 255, 255, 255, 255   -- 初始值 0xFFFFFFFF
+	local T0, T1, T2, T3 = CrcT0, CrcT1, CrcT2, CrcT3
 	for i = 1, #Data do
-		local Idx = XorByte[(Crc % 256) * 256 + Data:byte(i)]
-		Crc = Xor32(CrcTable[Idx], floor(Crc / 256))
+		local Idx = XorByte[b0 * 256 + Data:byte(i)]
+		b0 = XorByte[b1 * 256 + T0[Idx]]
+		b1 = XorByte[b2 * 256 + T1[Idx]]
+		b2 = XorByte[b3 * 256 + T2[Idx]]
+		b3 = T3[Idx]
 	end
-	return Xor32(Crc, 4294967295)
+	-- 收尾那次异或 0xFFFFFFFF 就是每个字节取反（字节取值范围恰好是 0..255）
+	return (255 - b3) * 16777216 + (255 - b2) * 65536 + (255 - b1) * 256 + (255 - b0)
 end
 
 --- 大端 32 位整数。
