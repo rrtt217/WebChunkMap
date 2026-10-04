@@ -56,7 +56,9 @@ R.TileCount = {}      -- [世界名] = 快照数
 R.Dirty = {}          -- [世界名] = true 表示有未落盘的改动
 R.LastSave = 0
 R.PluginFolder = nil
-R.Stats = { Renders = 0, CacheHits = 0, LiveTiles = 0, ReusedTiles = 0, LastRenderMs = 0, TileBuilds = 0 }
+R.Stats = { Renders = 0, CacheHits = 0, LiveTiles = 0, ReusedTiles = 0, LastRenderMs = 0, TileBuilds = 0,
+	-- 分阶段 CPU 时间累计（秒），配合 WebChunkMap_ProfDump() 看各阶段占比
+	PhaseGrid = 0, PhaseMarkers = 0, PhaseStruct = 0, PhasePixels = 0, PhasePng = 0 }
 
 local TILE_COLORS  = 768    -- 16 * 16 * 3  顶面颜色
 local TILE_HEIGHTS = 256    -- 16 * 16      地表高度（h+1，0 = 未知）
@@ -977,11 +979,13 @@ function R.Render(World, Opts)
 		end
 	end
 
+	local TGrid = Clock()
 	local Markers, PlayerCount = nil, 0
 	if (Cfg.DrawPlayers or Cfg.DrawSpawn) then
 		Markers, PlayerCount = CollectMarkers(World, OriginX, OriginZ, Blocks)
 	end
 
+	local TMarkers = Clock()
 	-- 结构位置（跨插件）。整段包 pcall：对方插件没装、函数改名、内部报错，
 	-- 一律当作"没有结构"处理，页面上永远不冒错误。
 	local StructMarkers, Structures = nil, nil
@@ -1002,6 +1006,7 @@ function R.Render(World, Opts)
 		end
 	end
 
+	local TStruct = Clock()
 	local GridFactor = 0.74
 	local Shade = Cfg.RememberedShade
 
@@ -1122,7 +1127,14 @@ function R.Render(World, Opts)
 	end
 
 	local Pixels = concat(Out)
+	local TPixels = Clock()
 	local Png = WCM_Png.Encode(ImgSize, ImgSize, Pixels, Cfg.PngFactor, Cfg.PngFilter)
+	local TPng = Clock()
+	R.Stats.PhaseGrid = R.Stats.PhaseGrid + (TGrid - T0)
+	R.Stats.PhaseMarkers = R.Stats.PhaseMarkers + (TMarkers - TGrid)
+	R.Stats.PhaseStruct = R.Stats.PhaseStruct + (TStruct - TMarkers)
+	R.Stats.PhasePixels = R.Stats.PhasePixels + (TPixels - TStruct)
+	R.Stats.PhasePng = R.Stats.PhasePng + (TPng - TPixels)
 
 	local Meta = {
 		WorldName = WorldName,
@@ -1790,7 +1802,28 @@ end
 --- 跑在 MCPServer 的 Lua 状态里，CallPlugin 也只能调对方导出的函数。
 --- 所以"哪些表在涨"只能靠读代码推算；有了这个出口就能直接看数。
 ---
--- luacheck: ignore WebChunkMap_MemStats
+-- luacheck: ignore WebChunkMap_ProfDump WebChunkMap_ProfReset WebChunkMap_MemStats
+--- 分阶段耗时（每次渲染的毫秒均值），用来定位渲染热点。
+function WebChunkMap_ProfDump()
+	local N = math.max(R.Stats.Renders, 1)
+	return {
+		Renders = R.Stats.Renders,
+		Grid = R.Stats.PhaseGrid * 1000 / N,
+		Markers = R.Stats.PhaseMarkers * 1000 / N,
+		Struct = R.Stats.PhaseStruct * 1000 / N,
+		Pixels = R.Stats.PhasePixels * 1000 / N,
+		Png = R.Stats.PhasePng * 1000 / N,
+		LastRenderMs = R.Stats.LastRenderMs,
+		TileBuilds = R.Stats.TileBuilds,
+		LiveTiles = R.Stats.LiveTiles,
+		ReusedTiles = R.Stats.ReusedTiles,
+	}
+end
+
+function WebChunkMap_ProfReset()
+	R.Stats.PhaseGrid, R.Stats.PhaseMarkers, R.Stats.PhaseStruct, R.Stats.PhasePixels, R.Stats.PhasePng = 0, 0, 0, 0, 0
+	R.Stats.Renders, R.Stats.LastRenderMs = 0, 0
+end
 --- 用法：cPluginManager:CallPlugin("WebChunkMap", "WebChunkMap_MemStats")
 --- 返回值只能是简单表/数字/字符串（跨插件不能传函数）。
 function WebChunkMap_MemStats()
