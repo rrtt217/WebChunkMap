@@ -351,7 +351,7 @@ local PAGE_CSS = [[
 <style>
 .wcm-map { position: relative; display: inline-block; line-height: 0; border: 1px solid #CCDDD9; background: #fff; }
 .wcm-map img { display: block; image-rendering: pixelated; }
-.wcm-map canvas { display: block; image-rendering: pixelated; }
+.wcm-map canvas { display: block; }
 .wcm-pending { display: flex; align-items: center; justify-content: center; color: #888;
 	background: #F4F7F6; font-size: 13px; }
 .wcm-sel { position: absolute; box-sizing: border-box; border: 2px solid #c14544; pointer-events: none; }
@@ -406,7 +406,7 @@ end
 --- 画布引导：把 payload 画到 canvas 上；浏览器不支持就显示回退链接。
 --- 单引号字符串里不能再出现单引号，所以用 [[ ]]。
 local CANVAS_BOOT = [[
-function WCMCanvas_mount(B64) {
+function WCMCanvas_mount(B64, Px) {
   var C = document.getElementById('wcm-canvas');
   var F = document.getElementById('wcm-canvas-fallback');
   function fail(M) {
@@ -415,7 +415,7 @@ function WCMCanvas_mount(B64) {
   }
   if (!C || !window.WCMCanvas) { fail(); return; }
   if (typeof DecompressionStream === 'undefined') { fail('浏览器不支持 DecompressionStream。'); return; }
-  WCMCanvas.draw(C, WCMCanvas.b64ToBytes(B64)).then(function (R) {
+  WCMCanvas.draw(C, WCMCanvas.b64ToBytes(B64), Px).then(function (R) {
     window.WCM_CANVAS_MS = R.TotalMs;
   }).catch(function (e) { fail('画布渲染失败：' + e); });
 }
@@ -525,12 +525,15 @@ local function BuildPage(Request, P, WInfo, Meta, Png, Bin, Notice, RefreshDelay
 	-- image-rendering: pixelated 保证是最近邻 —— 和服务端复制像素完全等价。
 	local UseCanvas = W.UseCanvas and (Bin ~= nil) and (W.CanvasJs ~= nil)
 	if UseCanvas then
-		local ImgW = Meta.ImgWidth or Meta.Width
-		A("<canvas id='wcm-canvas' width='" .. ImgW .. "' height='" .. ImgW
-			.. "' style='width:" .. Meta.Width .. "px;height:" .. Meta.Height .. "px'></canvas>")
+		-- 画布的 bitmap 尺寸 = 显示尺寸（1:1），放大由 canvas.js 里的 drawImage 做。
+		-- **不要**让 CSS 去缩放 canvas：Firefox 在 GPU 合成下会把这类 canvas 整块画成黑的
+		-- （Edge 正常、页面缩略图也正常 —— 数据没问题，是合成路径的问题）。
+		local DispPx = Meta.Width
+		A("<canvas id='wcm-canvas' width='" .. DispPx .. "' height='" .. DispPx
+			.. "' style='width:" .. DispPx .. "px;height:" .. DispPx .. "px'></canvas>")
 		A("<script>" .. W.CanvasJs .. "</script>")
 		A("<script>" .. CANVAS_BOOT .. "</script>")
-		A("<script>WCMCanvas_mount('" .. Base64Encode(Bin) .. "');</script>")
+		A("<script>WCMCanvas_mount('" .. Base64Encode(Bin) .. "', " .. DispPx .. ");</script>")
 		A("<div id='wcm-canvas-fallback' style='display:none;padding:8px;color:#a00;line-height:1.5'>"
 			.. "这个浏览器画不了 canvas（或渲染失败）。<a href='"
 			.. Esc(Base .. QueryString(P, "canvas=0")) .. "'>改用服务端 PNG</a>。</div>")

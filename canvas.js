@@ -231,8 +231,14 @@ var WCMCanvas = (function () {
 		return { Width: W, Height: H, Pixels: out };
 	}
 
-	/// 解压 -> 解析 -> 合成 -> 上屏。返回 {Ok, Ms, Meta}。
-	async function draw(canvas, compressed) {
+	/// 解压 -> 解析 -> 合成 -> 上屏。
+	/// displayPx 是显示边长（CSS 像素）；不传就按方块分辨率 1:1 显示。
+	///
+	/// ⚠ 放大**必须**在这里用 drawImage 做，不能让 CSS 去缩放 canvas：
+	/// 实测在 Firefox（有 GPU 合成的正常窗口）下，被 CSS 放大的 canvas 会整块变黑；
+	/// 同一份数据在 Edge 里正常、页面缩略图里也正常 —— 说明数据没问题，是合成路径的问题。
+	/// 无头 Firefox 复现不出来（它走软件合成），所以只能从代码上绕开那条路径。
+	async function draw(canvas, compressed, displayPx) {
 		var T0 = performance.now();
 		var ds = new DecompressionStream("deflate");
 		var w = ds.writable.getWriter();
@@ -243,15 +249,27 @@ var WCMCanvas = (function () {
 		var M = decode(raw);
 		var img = compose(M);
 		var T2 = performance.now();
-		canvas.width = img.Width;
-		canvas.height = img.Height;
-		var ctx = canvas.getContext("2d");
-		var id = ctx.createImageData(img.Width, img.Height);
+
+		// 先按方块分辨率画到离屏画布
+		var off = document.createElement("canvas");
+		off.width = img.Width;
+		off.height = img.Height;
+		var octx = off.getContext("2d");
+		var id = octx.createImageData(img.Width, img.Height);
 		id.data.set(img.Pixels);
-		ctx.putImageData(id, 0, 0);
+		octx.putImageData(id, 0, 0);
+
+		// 再按显示尺寸最近邻放大到可见画布：bitmap 与 CSS 尺寸 1:1，不再依赖 CSS 缩放
+		var DW = Math.max(1, Math.round(displayPx || img.Width));
+		if (canvas.width !== DW) { canvas.width = DW; }
+		if (canvas.height !== DW) { canvas.height = DW; }
+		var ctx = canvas.getContext("2d");
+		ctx.imageSmoothingEnabled = false;
+		if ("webkitImageSmoothingEnabled" in ctx) { ctx.webkitImageSmoothingEnabled = false; }
+		ctx.drawImage(off, 0, 0, DW, DW);
 		var T3 = performance.now();
 		return {
-			Ok: true, Model: M, Image: img,
+			Ok: true, Model: M, Image: img, DisplayPx: DW,
 			DecodeMs: T1 - T0, RenderMs: T2 - T1, PutMs: T3 - T2, TotalMs: T3 - T0
 		};
 	}
