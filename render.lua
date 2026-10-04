@@ -108,6 +108,18 @@ end
 
 R.Now = Now
 
+--- 山体阴影的明暗系数查表。
+--- F = 1 + (Here - There) * 0.05 被夹在 [0.62, 1.35]，而高度差是整数，
+--- 所以实际只有十几二十种取值 —— 查表替掉每像素的浮点乘 + 两次比较。
+--- 表覆盖高度差 -256..256（高度字节 0..255），夹取在构建时就做完了。
+local ShadeF = {}
+for D = -256, 256 do
+	local F = 1 + D * 0.05
+	if (F > 1.35) then F = 1.35 end
+	if (F < 0.62) then F = 0.62 end
+	ShadeF[D + 256] = F
+end
+
 local function Clock()
 	if (os ~= nil) and (os.clock ~= nil) then
 		return os.clock()
@@ -1014,20 +1026,53 @@ function R.Render(World, Opts)
 	local PIXEL_BATCH = 2048
 
 	local Out = {}
+	local IsBiome = (Mode == "biome")
+	local IsChunks = (Mode == "chunks")
+	local DrawGrid = Cfg.DrawChunkGrid and true or false
+	local Shading = Cfg.HillShading and (Mode == "topo") and true or false
+
+	-- 山体阴影要读"上一像素行"的高度，所以每行保留一份"每区块 16 字节"的高度带，
+	-- 两行轮换使用。这样阴影不用每像素去查 TileGrid、也不做除法。
+	local PrevRow, CurRow = {}, {}
+
 	for bz = 0, Blocks - 1 do
 		local RowChunk = floor(bz / 16)
 		local ty = bz % 16
 		local RowChunkBase = RowChunk * SizeChunks
 		local Row, Buf, Bn = {}, {}, 0
+		PrevRow, CurRow = CurRow, PrevRow
+
+		-- bx/16 与 bx%16 用递增计数器代替（原来是每像素两次除法 + 两次取模）；
+		-- 顺带在区块边界处把该区块的 Tile / State / 当前行高度带一次取好。
+		local cx, tx = -1, 15
+		local gi, Tile, State, CurBand = 0, nil, 0, nil
 
 		for bx = 0, Blocks - 1 do
 			local Cr, Cg, Cb
 
-			if (Mode == "biome") then
-				local BG = BiomeGrid[RowChunkBase + floor(bx / 16) + 1]
+			tx = tx + 1
+			if (tx == 16) then
+				tx = 0
+				cx = cx + 1
+				gi = RowChunkBase + cx + 1
+				Tile = TileGrid[gi]
+				State = StateGrid[gi] or 0
+				if Shading and (State ~= 0) and (Tile ~= nil) then
+					-- 一次取 16 列高度（原来是每像素一次 Tile:byte）。
+					-- 注意必须用 sub 而不是 byte：string.byte(s, i, j) 返回的是
+					-- **j-i+1 个值**，赋给一个变量只会拿到第一个字节的数字。
+					CurBand = Tile:sub(TILE_COLORS + ty * 16 + 1, TILE_COLORS + ty * 16 + 16)
+				else
+					CurBand = nil
+				end
+				CurRow[cx + 1] = CurBand
+			end
+
+			if IsBiome then
+				local BG = BiomeGrid[gi]
 				local B = 0
 				if (BG ~= nil) then
-					B = BG:byte(ty * 16 + (bx % 16) + 1) or 0
+					B = BG:byte(ty * 16 + tx + 1) or 0
 				end
 				if (B == 0) then
 					Cr, Cg, Cb = NoBiomeColor[1], NoBiomeColor[2], NoBiomeColor[3]
@@ -1040,32 +1085,33 @@ function R.Render(World, Opts)
 					Cr, Cg, Cb = C[1], C[2], C[3]
 				end
 			else
-				local gi = RowChunkBase + floor(bx / 16) + 1
-				local State = StateGrid[gi] or 0
-
-				if (Mode == "chunks") then
+				if IsChunks then
 					local C = StateColors[State]
 					Cr, Cg, Cb = C[1], C[2], C[3]
 				else
-					local Tile = TileGrid[gi]
-					local ti = (ty * 16 + (bx % 16)) * 3 + 1
+					local ti = (ty * 16 + tx) * 3 + 1
 					Cr, Cg, Cb = Tile:byte(ti, ti + 2)
 
-					-- 山体阴影：向西北邻居取高度，跨区块连续
-					if Cfg.HillShading and (bx > 0) and (bz > 0) and (State ~= 0) then
-						local nbx, nbz = bx - 1, bz - 1
-						local nt = TileGrid[floor(nbz / 16) * SizeChunks + floor(nbx / 16) + 1]
-						if (nt ~= nil) then
-							local Here = Tile:byte(TILE_COLORS + ty * 16 + (bx % 16) + 1)
-							local There = nt:byte(TILE_COLORS + (nbz % 16) * 16 + (nbx % 16) + 1)
-							if (Here > 0) and (There > 0) then
-								local F = 1 + (Here - There) * 0.05
-								if (F > 1.35) then F = 1.35 end
-								if (F < 0.62) then F = 0.62 end
-								Cr = floor(Cr * F)
-								Cg = floor(Cg * F)
-								Cb = floor(Cb * F)
-							end
+					-- 山体阴影：向西北邻居取高度，跨区块连续。
+					-- 高度已在区块边界按行预取好（CurBand / PrevRow），所以这里
+					-- 既不查 TileGrid 也不做除法；明暗系数查表。
+					-- 注意 PrevRow 里可能没有这一格（那个区块当时没有快照）——
+					-- 对应老代码里 nt == nil 的情况，跳过即可。
+					if Shading and (bx > 0) and (bz > 0) and (State ~= 0) then
+						local There
+						if (tx > 0) then
+							local PB = PrevRow[cx + 1]
+							There = (PB ~= nil) and PB:byte(tx) or nil
+						else
+							local PB = PrevRow[cx]
+							There = (PB ~= nil) and PB:byte(16) or nil
+						end
+						local Here = CurBand:byte(tx + 1)
+						if (Here ~= nil) and (There ~= nil) and (Here > 0) and (There > 0) then
+							local F = ShadeF[Here - There + 256]
+							Cr = floor(Cr * F)
+							Cg = floor(Cg * F)
+							Cb = floor(Cb * F)
 						end
 					end
 
@@ -1078,7 +1124,7 @@ function R.Render(World, Opts)
 			end
 
 			-- 区块边界
-			if Cfg.DrawChunkGrid and (((bx % 16) == 0) or ((bz % 16) == 0)) then
+			if (DrawGrid and ((tx == 0) or (ty == 0))) then
 				Cr = floor(Cr * GridFactor)
 				Cg = floor(Cg * GridFactor)
 				Cb = floor(Cb * GridFactor)
