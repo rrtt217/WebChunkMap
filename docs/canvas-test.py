@@ -31,7 +31,10 @@ def parse(data):
     n = size * size
     states = [0] * n
     pals, idxs, hts = [None] * n, [None] * n, [None] * n
-    p = 25
+    mode = data[6]
+    extra_len = struct.unpack_from("<H", data, 25)[0]
+    p = 27 + extra_len
+    assert mode == 0, "验证脚本目前只覆盖 topo 图层（mode=%d）" % mode
     for i in range(n):
         st = data[p]; p += 1; states[i] = st
         if st == 0:
@@ -48,6 +51,8 @@ def parse(data):
         if flags & 1:
             hts[i] = data[p:p + 256]; p += 256
     assert p == len(data), "记录长度对不上：用了 %d，实际 %d" % (p, len(data))
+    # 确认扩展段真的读对了（topo 的扩展段是 3 字节占位 + u16 0）
+    assert extra_len >= 5, "topo 的扩展段至少 5 字节，实际 %d" % extra_len
     return dict(flags=flags, size=size, gf=gf, shade=shade, unk=unk,
                 states=states, pals=pals, idxs=idxs, hts=hts)
 

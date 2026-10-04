@@ -523,7 +523,7 @@ local function BuildPage(Request, P, WInfo, Meta, Png, Bin, Notice, RefreshDelay
 	-- 优先画布：服务端只发"预打包调色板 + 高度 + 状态"，逐像素的合成在浏览器里做。
 	-- 画布的内在尺寸就是**方块分辨率**（Meta.ImgWidth），CSS 放大到显示尺寸，
 	-- image-rendering: pixelated 保证是最近邻 —— 和服务端复制像素完全等价。
-	local UseCanvas = W.UseCanvas and (Bin ~= nil) and (W.CanvasJs ~= nil) and (Meta.Mode == "topo")
+	local UseCanvas = W.UseCanvas and (Bin ~= nil) and (W.CanvasJs ~= nil)
 	if UseCanvas then
 		local ImgW = Meta.ImgWidth or Meta.Width
 		A("<canvas id='wcm-canvas' width='" .. ImgW .. "' height='" .. ImgW
@@ -554,7 +554,8 @@ local function BuildPage(Request, P, WInfo, Meta, Png, Bin, Notice, RefreshDelay
 
 	-- 画布模式下的标记：改成 DOM 叠加层 —— 比画进像素更清晰、与缩放无关、还能带 tooltip。
 	-- PNG 路径仍然把标记画进像素，所以这里**只在画布模式输出**，免得出现两份。
-	if UseCanvas then
+	-- 标记只在 topo 图层有意义（chunks / biome 是诊断视图，没有结构标记）
+	if UseCanvas and (Meta.Mode == "topo") then
 		local function Spot(BlockX, BlockZ, Px, Cls, Title)
 			local sx = (BlockX - Meta.OriginX) * Meta.Scale
 			local sz = (BlockZ - Meta.OriginZ) * Meta.Scale

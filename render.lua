@@ -983,10 +983,13 @@ local StateColors = {
 }
 
 --- 画布协议的头部长度与版本（格式见 AGENTS.md 第 4 节"画布协议"）
--- 头部字节数。注意 gridFactor / rememberedShade 用 **u16 存 4 位小数**（F*10000），
+-- 头部字节数 = 25 + 2（扩展段长度）。扩展段用来给 chunks / biome 图层带颜色表：
+--     u8 noBiomeRGB(3) | u16 biomeCount | biomeCount x (u8 id, u8 R, u8 G, u8 B)
+--     | u8 stateRGB[3][3]（chunks 图层的三档状态配色）
+-- 注意 gridFactor / rememberedShade 用 **u16 存 4 位小数**（F*10000），
 -- 不能存成一个字节：那会引入 0.16% 的量化误差，让网格线的 floor(Cr*F) 和
 -- 服务端差 1 —— 实测就这一个精度问题造成了 4.4 万个像素不一致。
-local BIN_HEADER = 25
+local BIN_HEADER = 27
 local BIN_VERSION = 1
 local GRID_FACTOR = 0.74      -- 区块网格线的压暗系数（和 PNG 路径保持一致）
 
@@ -1001,13 +1004,21 @@ local GRID_FACTOR = 0.74      -- 区块网格线的压暗系数（和 PNG 路径
 ---     state(1) + 调色板段(177，原样拷) + 高度(256，仅 topo 且开阴影时)
 --- state == 0 的未知区块只占 **1 字节**（颜色从头部取）。服务端的阴影本来就只对
 --- state ~= 0 的区块生效，所以丢掉那些高度不会有任何损失。
-local function BuildBinaryFromGrid(Plan, TileGrid, StateGrid, Cfg, Shading, DrawGrid)
+local function BuildBinaryFromGrid(Plan, TileGrid, StateGrid, BiomeGrid, Cfg, Shading, DrawGrid)
 	local SizeChunks = Plan.SizeChunks
 	local Buf = {}
 
 	Buf[#Buf + 1] = "WCMB"
 	Buf[#Buf + 1] = PackU16(BIN_VERSION)
-	Buf[#Buf + 1] = char(0, (Shading and 1 or 0) + (DrawGrid and 2 or 0))   -- mode, flags
+	-- 头部那个 mode 字节必须按图层填 —— 扩展段和记录布局都按它分派。
+	-- （曾经写死 0，于是 biome 的 payload 头部自称是 topo，解析全乱。）
+	local ModeByte = 0
+	if (Plan.Mode == "chunks") then
+		ModeByte = 1
+	elseif (Plan.Mode == "biome") then
+		ModeByte = 2
+	end
+	Buf[#Buf + 1] = char(ModeByte, (Shading and 1 or 0) + (DrawGrid and 2 or 0))   -- mode, flags
 	Buf[#Buf + 1] = PackI32(Plan.OriginChunkX)
 	Buf[#Buf + 1] = PackI32(Plan.OriginChunkZ)
 	Buf[#Buf + 1] = PackU16(SizeChunks)
@@ -1015,17 +1026,72 @@ local function BuildBinaryFromGrid(Plan, TileGrid, StateGrid, Cfg, Shading, Draw
 	Buf[#Buf + 1] = PackU16(floor((tonumber(Cfg.RememberedShade) or 1) * 10000 + 0.5) % 65536)
 	Buf[#Buf + 1] = R.UnknownTile():sub(1, 3)   -- 未知区块的占位色
 
+	-- 扩展段：chunks / biome 图层要的颜色表
+	local Extra = {}
+	if (Plan.Mode == "chunks") then
+		for i = 0, 2 do
+			local C = StateColors[i] or StateColors[0]
+			Extra[#Extra + 1] = char(C[1], C[2], C[3])
+		end
+	elseif (Plan.Mode == "biome") then
+		Extra[#Extra + 1] = char(NoBiomeColor[1], NoBiomeColor[2], NoBiomeColor[3])
+		-- 把视野里出现过的群系 id 收成一张表。用一次 byte(1,256) 取整段，
+		-- 不要逐字节调 byte —— 那是 256 次 C 调用/区块，乘 2304 个区块就是几十毫秒。
+		local Seen, List = {}, {}
+		for _, Seg in pairs(BiomeGrid or {}) do
+			local Bytes = { Seg:byte(1, 256) }
+			for i = 1, 256 do
+				local B = Bytes[i]
+				if (Seen[B] == nil) then
+					Seen[B] = true
+					local C
+					if (B == 0) then
+						C = NoBiomeColor
+					else
+						C = WCM_Blocks.Biomes[B - 1]
+						if (C == nil) then
+							C = WCM_Blocks.AutoColor(B - 1)
+						end
+					end
+					List[#List + 1] = char(B, C[1], C[2], C[3])
+				end
+			end
+		end
+		Extra[#Extra + 1] = PackU16(#List)
+		Extra[#Extra + 1] = concat(List)
+	else
+		Extra[#Extra + 1] = char(0, 0, 0)
+		Extra[#Extra + 1] = PackU16(0)
+	end
+	local ExtraStr = concat(Extra)
+	Buf[#Buf + 1] = PackU16(#ExtraStr)
+	Buf[#Buf + 1] = ExtraStr
+
+	local IsChunks = (Plan.Mode == "chunks")
+	local IsBiome = (Plan.Mode == "biome")
+	local ZeroBiomes = char(0):rep(TILE_BIOMES)
+
 	for cz = 0, SizeChunks - 1 do
 		for cx = 0, SizeChunks - 1 do
 			local gi = cz * SizeChunks + cx + 1
 			local State = StateGrid[gi] or 0
-			local Tile = TileGrid[gi]
 			Buf[#Buf + 1] = char(State)
-			if (State ~= 0) and (Tile ~= nil) then
-				-- 快照里那 177 字节正好就是线上格式，原样拷（补零由 deflate 吃掉）
-				Buf[#Buf + 1] = Tile:sub(OFF_PALCOUNT + 1, TILE_SIZE)
-				if Shading then
-					Buf[#Buf + 1] = Tile:sub(TILE_COLORS + 1, TILE_COLORS + TILE_HEIGHTS)
+
+			-- chunks 图层的颜色只由状态决定（表在扩展段里），所以**一个区块一个字节**。
+			-- 这一层就从"整张 PNG"变成 1 B/区块，服务端几乎不花时间了。
+			if (State ~= 0) and (not IsChunks) then
+				if IsBiome then
+					local Seg = (BiomeGrid ~= nil) and BiomeGrid[gi] or nil
+					Buf[#Buf + 1] = (Seg ~= nil) and Seg or ZeroBiomes
+				else
+					local Tile = TileGrid[gi]
+					if (Tile ~= nil) then
+						-- 快照里那 177 字节正好就是线上格式，原样拷（补零由 deflate 吃掉）
+						Buf[#Buf + 1] = Tile:sub(OFF_PALCOUNT + 1, TILE_SIZE)
+						if Shading then
+							Buf[#Buf + 1] = Tile:sub(TILE_COLORS + 1, TILE_COLORS + TILE_HEIGHTS)
+						end
+					end
 				end
 			end
 		end
@@ -1196,16 +1262,16 @@ function R.Render(World, Opts)
 	local DrawGrid = Cfg.DrawChunkGrid and true or false
 	local Shading = Cfg.HillShading and (Mode == "topo") and true or false
 	local BinData, BinRaw = nil, nil
-	if Cfg.CanvasPayload and (Mode == "topo") then
+	if Cfg.CanvasPayload then
 		local TBin0 = Clock()
-		BinData, BinRaw = BuildBinaryFromGrid(Plan, TileGrid, StateGrid, Cfg, Shading, DrawGrid)
+		BinData, BinRaw = BuildBinaryFromGrid(Plan, TileGrid, StateGrid, BiomeGrid, Cfg, Shading, DrawGrid)
 		R.Stats.PhaseBin = R.Stats.PhaseBin + (Clock() - TBin0)
 	end
 
 	-- 是否还要产出 PNG。切到画布之后就不需要了 —— 跳过整个像素合成 + PNG 编码
 	-- （48 区块视野实测约 216 + 60 ms，是服务端唯一的大头，而且它占着世界 tick 线程）。
 	-- 拿不到画布 payload 时（比如非 topo 图层）自动退回去出 PNG。
-	local WantPng = Opts.NoCanvas or (not (Cfg.CanvasOnly and (Mode == "topo") and (BinData ~= nil)))
+	local WantPng = Opts.NoCanvas or (not (Cfg.CanvasOnly and (BinData ~= nil)))
 	local Png = nil
 	if WantPng then
 		local Out = {}
