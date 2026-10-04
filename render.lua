@@ -67,10 +67,84 @@ local TILE_HEIGHTS = 256    -- 16 * 16      地表高度（h+1，0 = 未知）
 local TILE_BIOMES  = 256    -- 16 * 16      生物群系（biome+1，0 = 未知）
 local OFF_HEIGHTS  = TILE_COLORS
 local OFF_BIOMES   = TILE_COLORS + TILE_HEIGHTS
-local TILE_SIZE    = TILE_COLORS + TILE_HEIGHTS + TILE_BIOMES
+-- v3 追加的"调色板形式"段（见 BuildPaletteForm 的说明），固定 177 字节
+local PAL_MAX      = 16     -- 调色板最多 16 色（实测每个区块最多 10 色）
+local PAL_COUNT    = 1
+local PAL_RGB      = PAL_MAX * 3
+local PAL_INDICES  = TILE_HEIGHTS / 2   -- 256 个像素 x 4 位 = 128 字节
+local TILE_EXTRA   = PAL_COUNT + PAL_RGB + PAL_INDICES
+local TILE_BASE    = TILE_COLORS + TILE_HEIGHTS + TILE_BIOMES
+local TILE_SIZE    = TILE_BASE + TILE_EXTRA
+local OFF_PALCOUNT = TILE_BASE
+local OFF_PALETTE  = TILE_BASE + PAL_COUNT
+local OFF_INDICES  = OFF_PALETTE + PAL_RGB
+
+R.OFF_PALCOUNT, R.OFF_PALETTE, R.OFF_INDICES, R.TILE_SIZE = OFF_PALCOUNT, OFF_PALETTE, OFF_INDICES, TILE_SIZE
+
+--- 从 768 字节颜色段生成 v3 的"调色板形式"扩展段（177 字节）：
+---   [0]        调色板颜色数；**0 表示颜色种类超过 16**，调用方应回退用 RGB 段
+---   [1..48]    最多 16 个 RGB 三元组（不足的补 0）
+---   [49..176]  4 位索引，每字节两个像素（256 像素 = 128 字节）
+---
+--- 为什么要在这里预打包：实测 6000 个区块，每个区块顶面**最多只有 10 种颜色、
+--- 100% 不超过 16 种**，所以 4 位索引是**无损**的，压缩后也比 RGB 小得多。
+--- 关键是不能在渲染时打包 —— Lua 里逐像素建表 + 打包的成本和现在的像素循环
+--- 同量级，那样画布迁移省下的 CPU 就全还回去了。所以随快照一起算一次、存盘。
+local function BuildPaletteForm(ColorSeg)
+	local Seen, Pal, Idx = {}, {}, {}
+	for i = 0, 255 do
+		local C = ColorSeg:sub(i * 3 + 1, i * 3 + 3)
+		local n = Seen[C]
+		if (n == nil) then
+			if (#Pal >= PAL_MAX) then
+				-- 极少数颜色太杂的区块：标记 0，渲染时回退到 RGB 段
+				return char(0) .. char(0):rep(TILE_EXTRA - 1)
+			end
+			n = #Pal
+			Seen[C] = n
+			Pal[n + 1] = C
+		end
+		Idx[i + 1] = n
+	end
+	local Packed = {}
+	for i = 1, 256, 2 do
+		Packed[(i + 1) / 2] = char(Idx[i] * 16 + Idx[i + 1])
+	end
+	return char(#Pal) .. concat(Pal) .. char(0):rep((PAL_MAX - #Pal) * 3) .. concat(Packed)
+end
+
+--- 把 v2 的 1280 字节快照补上调色板段，升级成 v3。
+local function UpgradeTileToV3(Tile)
+	return Tile .. BuildPaletteForm(Tile:sub(1, TILE_COLORS))
+end
+
+--- 把 v3 快照里的调色板形式还原成 768 字节 RGB（自检与协议都用得到）。
+--- 返回 nil 表示这个区块是"颜色超过 16 种"的回退情况，应改用 RGB 段。
+function R.TilePaletteRGB(Tile)
+	local N = Tile:byte(OFF_PALCOUNT + 1)
+	if (N == nil) or (N == 0) then
+		return nil
+	end
+	local Pal = Tile:sub(OFF_PALETTE + 1, OFF_PALETTE + PAL_RGB)
+	local Packed = Tile:sub(OFF_INDICES + 1, OFF_INDICES + PAL_INDICES)
+	local Out = {}
+	for i = 0, 255 do
+		local B = Packed:byte(floor(i / 2) + 1)
+		local n
+		if ((i % 2) == 0) then
+			n = floor(B / 16)
+		else
+			n = B % 16
+		end
+		Out[i + 1] = Pal:sub(n * 3 + 1, n * 3 + 3)
+	end
+	return concat(Out)
+end
 
 local MAGIC = "WCMT"
-local VERSION = 2
+-- 3 = 在 v2 的 1280 字节后面追加了"调色板形式"段（见 BuildPaletteForm）。
+-- 加载器**仍然接受 v2** 并就地升级，所以升级不会丢掉已经攒下的快照。
+local VERSION = 3
 
 local function Log(Msg)
 	LOG("WebChunkMap: " .. Msg)
@@ -163,7 +237,8 @@ function R.UnknownTile()
 		for i = 1, TILE_HEIGHTS do
 			Colors[i] = Px
 		end
-		UnknownTileCache = concat(Colors) .. char(0):rep(TILE_HEIGHTS + TILE_BIOMES)
+		local Seg = concat(Colors)
+		UnknownTileCache = Seg .. char(0):rep(TILE_HEIGHTS + TILE_BIOMES) .. BuildPaletteForm(Seg)
 	end
 	return UnknownTileCache
 end
@@ -428,7 +503,12 @@ function R.LoadTiles(Folder)
 	end
 
 	local Ver = UnpackU16(Head, 5)
-	if (Ver ~= VERSION) then
+	-- v2 的文件照旧接受：读进来后就地补上调色板段升级到 v3。
+	-- 升级不该丢掉已经攒下的几千个快照（重扫一遍要跑遍世界，代价很大）。
+	local OnDisk = TILE_SIZE
+	if (Ver == 2) then
+		OnDisk = TILE_BASE
+	elseif (Ver ~= VERSION) then
 		F:close()
 		Log("快照版本不匹配（文件 " .. tostring(Ver) .. "，期望 " .. VERSION .. "），忽略")
 		return 0
@@ -442,7 +522,7 @@ function R.LoadTiles(Folder)
 			break
 		end
 		local NameLen = LenB:byte(1)
-		local RecordBytes = NameLen + 8 + TILE_SIZE
+		local RecordBytes = NameLen + 8 + OnDisk
 		local Rest = F:read(RecordBytes)
 		if (Rest == nil) or (#Rest < RecordBytes) then
 			break
@@ -457,8 +537,11 @@ function R.LoadTiles(Folder)
 		end
 		local CX = UnpackI32(Rest, NameLen + 1)
 		local CZ = UnpackI32(Rest, NameLen + 5)
-		local Tile = Rest:sub(NameLen + 9, NameLen + 8 + TILE_SIZE)
-		if ((CX ~= nil) and (CZ ~= nil) and (#Tile == TILE_SIZE)) then
+		local Tile = Rest:sub(NameLen + 9, NameLen + 8 + OnDisk)
+		if ((CX ~= nil) and (CZ ~= nil) and (#Tile == OnDisk)) then
+			if (OnDisk ~= TILE_SIZE) then
+				Tile = UpgradeTileToV3(Tile)   -- v2 -> v3
+			end
 			R.PutTile(WorldName, CX, CZ, Tile, true)
 			Loaded = Loaded + 1
 			Bytes = Bytes + 1 + RecordBytes
@@ -544,7 +627,8 @@ function R.BuildTile(World, CX, CZ)
 	end
 
 	R.Stats.TileBuilds = R.Stats.TileBuilds + 1
-	return concat(Colors) .. char(unpack(Heights)) .. char(unpack(Biomes))
+	local Seg = concat(Colors)
+	return Seg .. char(unpack(Heights)) .. char(unpack(Biomes)) .. BuildPaletteForm(Seg)
 end
 
 --- 只构建一个区块的生物群系段（256 字节），供 biome 图层使用。
@@ -1904,7 +1988,34 @@ end
 --- 跑在 MCPServer 的 Lua 状态里，CallPlugin 也只能调对方导出的函数。
 --- 所以"哪些表在涨"只能靠读代码推算；有了这个出口就能直接看数。
 ---
--- luacheck: ignore WebChunkMap_ProfDump WebChunkMap_ProfReset WebChunkMap_MemStats
+-- luacheck: ignore WebChunkMap_SelfCheck WebChunkMap_ProfDump WebChunkMap_ProfReset WebChunkMap_MemStats
+--- 自检：验证每个快照的"调色板形式"能不能无损还原出 RGB 段。
+--- 迁移期间用（确认 v2->v3 的升级没有写坏颜色），结果是个纯值表，跨插件可读。
+function WebChunkMap_SelfCheck()
+	local Res = { Total = 0, Ok = 0, Mismatch = 0, Fallback = 0, BadLen = 0,
+		Version = VERSION, TileSize = TILE_SIZE, PerWorld = {} }
+	for WorldName, T in pairs(R.Tiles) do
+		local n = 0
+		for _, Tile in pairs(T) do
+			n = n + 1
+			Res.Total = Res.Total + 1
+			if (#Tile ~= TILE_SIZE) then
+				Res.BadLen = Res.BadLen + 1
+			else
+				local RGB = R.TilePaletteRGB(Tile)
+				if (RGB == nil) then
+					Res.Fallback = Res.Fallback + 1
+				elseif (RGB == Tile:sub(1, TILE_COLORS)) then
+					Res.Ok = Res.Ok + 1
+				else
+					Res.Mismatch = Res.Mismatch + 1
+				end
+			end
+		end
+		Res.PerWorld[#Res.PerWorld + 1] = WorldName .. "=" .. n
+	end
+	return Res
+end
 --- 分阶段耗时（每次渲染的毫秒均值），用来定位渲染热点。
 function WebChunkMap_ProfDump()
 	local N = math.max(R.Stats.Renders, 1)
