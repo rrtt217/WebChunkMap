@@ -356,7 +356,8 @@ local PAGE_CSS = [[
 	background: #F4F7F6; font-size: 13px; }
 .wcm-sel { position: absolute; box-sizing: border-box; border: 2px solid #c14544; pointer-events: none; }
 /* 画布模式下的标记：DOM 叠加层（PNG 路径仍然把标记画进像素） */
-.wcm-mk { position: absolute; box-sizing: border-box; pointer-events: none; }
+.wcm-mk { position: absolute; box-sizing: border-box; cursor: help; }
+.wcm-hit { position: absolute; display: block; }
 .wcm-mk-player { background: #e63c3c; border: 2px solid #fff; }
 .wcm-mk-spawn { background: #46a0ff; border: 2px solid #fff; }
 .wcm-mk-struct { background: #d8a03c; border: 2px solid #fff; }
@@ -422,6 +423,10 @@ function WCMCanvas_mount(B64, Px) {
 ]]
 
 local function BuildPage(Request, P, WInfo, Meta, Png, Bin, Notice, RefreshDelay, InfoStale, QueuedRender)
+	-- 画布模式下缓存里没有 PNG、只有 payload，所以"这一帧有东西可显示"要两个都看。
+	-- 下面几处（重绘提示、加载可见区块按钮）原来都写的是 Png ~= nil ——
+	-- 切到画布后它们就一起静默消失了，别再用 Png 当唯一判据。
+	local Showable = (Png ~= nil) or (Bin ~= nil)
 	local Path = RequestPath(Request)
 	local Base = Path .. "?"
 	local _, SelList = ParseSelection(P.sel)
@@ -557,6 +562,26 @@ local function BuildPage(Request, P, WInfo, Meta, Png, Bin, Notice, RefreshDelay
 
 	-- 画布模式下的标记：改成 DOM 叠加层 —— 比画进像素更清晰、与缩放无关、还能带 tooltip。
 	-- PNG 路径仍然把标记画进像素，所以这里**只在画布模式输出**，免得出现两份。
+	-- 画布模式下的"点选区块"：<img usemap> 那套用不了（usemap 对 canvas 无效），
+	-- 所以改成绝对定位的透明 <a> 命中区，每区块一个。放在标记**下面**，
+	-- 这样标记的 tooltip 还能用（标记本身占的位置点下去不会选中，可接受）。
+	if UseCanvas and Clickable then
+		for cz = 0, Meta.SizeChunks - 1 do
+			for cx = 0, Meta.SizeChunks - 1 do
+				local ChunkX = Meta.OriginChunkX + cx
+				local ChunkZ = Meta.OriginChunkZ + cz
+				local Q = QueryString({
+					world = P.world, mode = P.mode, sel = ToggleSelection(P.sel, ChunkX, ChunkZ),
+					cx = P.cx, cz = P.cz, size = P.size, scale = P.scale,
+				})
+				A("<a class='wcm-hit' href='" .. Esc(Base .. Q) .. "' title='"
+					.. Esc("区块 (" .. ChunkX .. ", " .. ChunkZ .. ")") .. "' style='left:" .. (cx * ChunkPx)
+					.. "px;top:" .. (cz * ChunkPx) .. "px;width:" .. ChunkPx .. "px;height:" .. ChunkPx
+					.. "px'></a>")
+			end
+		end
+	end
+
 	-- 标记只在 topo 图层有意义（chunks / biome 是诊断视图，没有结构标记）
 	if UseCanvas and (Meta.Mode == "topo") then
 		local function Spot(BlockX, BlockZ, Px, Cls, Title)
@@ -617,11 +642,11 @@ local function BuildPage(Request, P, WInfo, Meta, Png, Bin, Notice, RefreshDelay
 		A("<p>视野太大，已关闭点击选块（把视野调到 32 区块以内即可）。</p>")
 	end
 
-	if QueuedRender and (Png ~= nil) then
+	if QueuedRender and Showable then
 		A("<p>缓存已过期，正在后台重绘（当前显示的是上一次的结果，页面不会自动跳转）。</p>")
 	end
 
-	if (Meta.WarmMissing > 0) and (Png ~= nil) then
+	if (Meta.WarmMissing > 0) and Showable then
 		A("<p><a href='" .. Esc(Base .. QueryString(P) .. "&warm=1") .. "'>⏬ 加载可见区块</a>"
 			.. " —— 未加载 <b>" .. Meta.WarmMissing .. "</b> 个（未见 <b>" .. Meta.WarmMissingUnknown
 			.. "</b> · 记忆中 <b>" .. Meta.WarmMissingRemembered
