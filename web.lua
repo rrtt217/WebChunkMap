@@ -572,7 +572,13 @@ local function BuildPage(Request, P, WInfo, Meta, Png, Notice, RefreshDelay, Inf
 		A(" <span style='color:#a00'>已按像素上限从 " .. Meta.RequestedSizeChunks .. " 区块收缩</span>")
 	end
 	A("</td></tr>")
-	A("<tr><th>图片</th><td>" .. Meta.Width .. "x" .. Meta.Height)
+	-- PNG 的真实像素（方块分辨率）与显示尺寸可能不同：放大是浏览器用
+	-- image-rendering: pixelated 做的（最近邻），所以两者只在 scale > 1 时不等。
+	local ImgW = Meta.ImgWidth or Meta.Width
+	A("<tr><th>图片</th><td>" .. ImgW .. "x" .. (Meta.ImgHeight or ImgW))
+	if ((Meta.ImgWidth ~= nil) and (Meta.ImgWidth ~= Meta.Width)) then
+		A(" <span style='color:#888'>（显示 " .. Meta.Width .. "x" .. Meta.Height .. "）</span>")
+	end
 	if (Png ~= nil) then
 		A("，" .. string.format("%.1f", Meta.PngBytes / 1024) .. " KiB")
 	end

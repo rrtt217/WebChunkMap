@@ -894,7 +894,7 @@ function R.Render(World, Opts)
 	local SizeChunks = Plan.SizeChunks
 	local Scale = Plan.Scale
 	local Blocks = Plan.Blocks
-	local ImgSize = Plan.Width
+	local ImgSize = Plan.ImgWidth or Plan.Width
 	local OriginX, OriginZ = Plan.OriginX, Plan.OriginZ
 	local RequestedSize, SizeClamped = Plan.RequestedSizeChunks, Plan.SizeClamped
 
@@ -1169,24 +1169,19 @@ function R.Render(World, Opts)
 
 			-- 数字缓冲 + char(unpack(...)) 分批：原来每个格子是 char() 加 :rep()
 			-- 两次分配，大视野下就是百万级可回收对象。表里放数字不进 GC。
-			for _ = 1, Scale do
-				Bn = Bn + 1; Buf[Bn] = Cr
-				Bn = Bn + 1; Buf[Bn] = Cg
-				Bn = Bn + 1; Buf[Bn] = Cb
-				if (Bn >= PIXEL_BATCH) then
-					Row[#Row + 1] = char(unpack(Buf, 1, Bn))
-					Bn = 0
-				end
+			Bn = Bn + 1; Buf[Bn] = Cr
+			Bn = Bn + 1; Buf[Bn] = Cg
+			Bn = Bn + 1; Buf[Bn] = Cb
+			if (Bn >= PIXEL_BATCH) then
+				Row[#Row + 1] = char(unpack(Buf, 1, Bn))
+				Bn = 0
 			end
 		end
 		if (Bn > 0) then
 			Row[#Row + 1] = char(unpack(Buf, 1, Bn))
 		end
 
-		local RowStr = concat(Row)
-		for _ = 1, Scale do
-			Out[#Out + 1] = RowStr
-		end
+		Out[#Out + 1] = concat(Row)
 	end
 
 	local Pixels = concat(Out)
@@ -1209,8 +1204,10 @@ function R.Render(World, Opts)
 		Blocks = Blocks,
 		OriginX = OriginX,
 		OriginZ = OriginZ,
-		Width = ImgSize,
-		Height = ImgSize,
+		Width = Plan.Width,          -- 显示尺寸（web.lua 的叠加层 / 点击坐标用它）
+		Height = Plan.Width,
+		ImgWidth = ImgSize,          -- PNG 的真实像素
+		ImgHeight = ImgSize,
 		Players = PlayerCount,
 		Structures = Structures,
 		OriginChunkX = BaseCX,
@@ -1287,18 +1284,21 @@ function R.Plan(Opts, SpawnX, SpawnZ)
 	if (Scale < 1) then Scale = 1 end
 	if (Scale > 4) then Scale = 4 end
 
-	-- 按像素预算收缩：优先落到预设档位
-	if ((SizeChunks * 16 * Scale) * (SizeChunks * 16 * Scale)) > Cfg.MaxPixels then
+	-- 按像素预算收缩：优先落到预设档位。
+	-- 注意预算现在只按**方块分辨率**算（以前乘了 Scale）—— 因为图片不再把每个像素
+	-- 复制 Scale 次，放大交给浏览器（见 R.Render 顶部与 web.lua 的 pixelated）。
+	-- 副作用是好的：同样预算下 scale=2 能显示的世界多了一倍。
+	if ((SizeChunks * 16) * (SizeChunks * 16)) > Cfg.MaxPixels then
 		local Best = nil
 		for _, Step in ipairs(R.SizeSteps) do
-			if (Step <= SizeChunks) and (((Step * 16 * Scale) * (Step * 16 * Scale)) <= Cfg.MaxPixels) then
+			if (Step <= SizeChunks) and (((Step * 16) * (Step * 16)) <= Cfg.MaxPixels) then
 				Best = Step
 			end
 		end
 		if (Best ~= nil) then
 			SizeChunks = Best
 		else
-			while (SizeChunks > 1) and (((SizeChunks * 16 * Scale) * (SizeChunks * 16 * Scale)) > Cfg.MaxPixels) do
+			while (SizeChunks > 1) and (((SizeChunks * 16) * (SizeChunks * 16)) > Cfg.MaxPixels) do
 				SizeChunks = SizeChunks - 1
 			end
 		end
@@ -1322,8 +1322,13 @@ function R.Plan(Opts, SpawnX, SpawnZ)
 		SizeClamped = (SizeChunks ~= RequestedSize),
 		Scale = Scale,
 		Blocks = Blocks,
+		-- Width/Height 是**显示**尺寸：web.lua 用它排叠加层和算点击坐标。
 		Width = Blocks * Scale,
 		Height = Blocks * Scale,
+		-- ImgWidth/ImgHeight 是 PNG 的真实像素：永远是方块分辨率，
+		-- 与 Scale 无关（放大由浏览器做，最近邻，视觉完全等价）。
+		ImgWidth = Blocks,
+		ImgHeight = Blocks,
 		CenterX = CenterX,
 		CenterZ = CenterZ,
 		OriginX = OriginX,

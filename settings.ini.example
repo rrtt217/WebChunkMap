@@ -23,7 +23,11 @@ UseInlineImages=1
 CacheTTL=600
 ; 图片缓存条目上限
 MaxCacheEntries=24
-; 单张图片最大像素数（宽*高），超出会自减视野
+; 单张图片最大像素数（宽*高），超出会自减视野。
+; 按**方块分辨率**算：一张 size=N 的图是 (N*16)^2 像素。
+; 注意它与缩放无关 —— PNG 永远按方块分辨率渲染，放大由浏览器做
+;（image-rendering: pixelated，最近邻，视觉零损失）。
+; 所以调大它 = 一次能看到更多区块，而不是"图片更清晰"。
 MaxPixels=1000000
 ; 允许的最大视野（区块）
 MaxSizeChunks=48
