@@ -129,15 +129,24 @@ var WCMCanvas = (function () {
 					ii[k] = (k & 1) ? (pk[k >> 1] & 15) : (pk[k >> 1] >> 4);
 				}
 				idxs[i] = ii;
+				p += REC_PALETTE;
 			} else {
-				pals[i] = buf.subarray(p + 1, p + 769);
+				// count == 0：这个区块颜色超过 16 种，服务端改发 768 字节 RGB 段。
+				// 服务端那边必须发同样长度 —— 只发 177 字节会从这里开始整体错位。
+				pals[i] = buf.subarray(p, p + 768);
 				idxs[i] = null;
+				p += 768;
 			}
-			p += REC_PALETTE;
 			if (flags & 1) {
 				hts[i] = buf.subarray(p, p + REC_HEIGHTS);
 				p += REC_HEIGHTS;
 			}
+		}
+
+		// 长度自检：错位会让颜色变成 0（整张图变黑），而且**不会报错**。
+		// 与其让用户看到一张全黑的地图，不如在这里炸出来 —— 引导脚本会把错误显示成回退提示。
+		if (p !== buf.length) {
+			throw new Error("画布 payload 解析长度不符：用了 " + p + " 字节，实际 " + buf.length);
 		}
 
 		return {

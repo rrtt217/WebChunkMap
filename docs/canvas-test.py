@@ -39,15 +39,18 @@ def parse(data):
         st = data[p]; p += 1; states[i] = st
         if st == 0:
             continue
-        pal = data[p:p + 177]
-        cnt = pal[0]
+        cnt = data[p]
         if cnt > 0:
+            pal = data[p:p + 177]
             pals[i] = pal[1:1 + cnt * 3]
             pk = pal[49:177]
             idxs[i] = [(pk[q >> 1] >> 4) if q % 2 == 0 else (pk[q >> 1] & 15) for q in range(256)]
+            p += 177
         else:
-            pals[i] = pal[1:769]; idxs[i] = None
-        p += 177
+            # count == 0：这个区块颜色超过 16 种，服务端改发 768 字节 RGB 段
+            pals[i] = data[p:p + 768]
+            idxs[i] = None
+            p += 768
         if flags & 1:
             hts[i] = data[p:p + 256]; p += 256
     assert p == len(data), "记录长度对不上：用了 %d，实际 %d" % (p, len(data))

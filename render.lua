@@ -1086,8 +1086,15 @@ local function BuildBinaryFromGrid(Plan, TileGrid, StateGrid, BiomeGrid, Cfg, Sh
 				else
 					local Tile = TileGrid[gi]
 					if (Tile ~= nil) then
-						-- 快照里那 177 字节正好就是线上格式，原样拷（补零由 deflate 吃掉）
-						Buf[#Buf + 1] = Tile:sub(OFF_PALCOUNT + 1, TILE_SIZE)
+						-- 快照里那 177 字节正好就是线上格式，原样拷（补零由 deflate 吃掉）。
+						-- 例外：调色板颜色数为 0 表示"这个区块颜色超过 16 种"，
+						-- 那时客户端的约定是**改成读 768 字节 RGB 段** —— 两边必须一致，
+						-- 只发 177 字节会让客户端从那里开始整体错位（表现为整张图变黑）。
+						if (Tile:byte(OFF_PALCOUNT + 1) == 0) then
+							Buf[#Buf + 1] = Tile:sub(1, TILE_COLORS)
+						else
+							Buf[#Buf + 1] = Tile:sub(OFF_PALCOUNT + 1, TILE_SIZE)
+						end
 						if Shading then
 							Buf[#Buf + 1] = Tile:sub(TILE_COLORS + 1, TILE_COLORS + TILE_HEIGHTS)
 						end
