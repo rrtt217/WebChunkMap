@@ -1035,11 +1035,36 @@ function R.Render(World, Opts)
 	-- 两行轮换使用。这样阴影不用每像素去查 TileGrid、也不做除法。
 	local PrevRow, CurRow = {}, {}
 
+	-- 标记按"像素行"分组一次。标记本来就很稀疏（结构 + 玩家 + 出生点，几十个），
+	-- 而像素循环有几十万次 —— 原来每像素要查两次哈希表。
+	-- 分组后每行只查一次，绝大多数行根本没有标记，于是每像素只剩一次 nil 判断。
+	-- 顺序有意为之：先结构、后玩家 / 出生点，后者压在上面。
+	local RowsMk = nil
+	if (StructMarkers ~= nil) or (Markers ~= nil) then
+		local Srcs = {}
+		if (StructMarkers ~= nil) then Srcs[#Srcs + 1] = StructMarkers end
+		if (Markers ~= nil) then Srcs[#Srcs + 1] = Markers end
+		RowsMk = {}
+		for si = 1, #Srcs do
+			for MKey, Mk in pairs(Srcs[si]) do
+				local pz = MKey % 4096
+				local px = floor(MKey / 4096)
+				local RowT = RowsMk[pz]
+				if (RowT == nil) then
+					RowT = {}
+					RowsMk[pz] = RowT
+				end
+				RowT[px] = Mk
+			end
+		end
+	end
+
 	for bz = 0, Blocks - 1 do
 		local RowChunk = floor(bz / 16)
 		local ty = bz % 16
 		local RowChunkBase = RowChunk * SizeChunks
 		local Row, Buf, Bn = {}, {}, 0
+		local RowMk = (RowsMk ~= nil) and RowsMk[bz] or nil
 		PrevRow, CurRow = CurRow, PrevRow
 
 		-- bx/16 与 bx%16 用递增计数器代替（原来是每像素两次除法 + 两次取模）；
@@ -1130,17 +1155,9 @@ function R.Render(World, Opts)
 				Cb = floor(Cb * GridFactor)
 			end
 
-			-- 结构标记（压在玩家 / 出生点下面，别把玩家盖住）
-			if (StructMarkers ~= nil) then
-				local Mk = StructMarkers[bx * 4096 + bz]
-				if (Mk ~= nil) then
-					Cr, Cg, Cb = Mk[1], Mk[2], Mk[3]
-				end
-			end
-
-			-- 玩家 / 出生点标记
-			if (Markers ~= nil) then
-				local Mk = Markers[bx * 4096 + bz]
+			-- 标记（结构和玩家 / 出生点已经按行合并好了，见上面的 RowsMk）
+			if (RowMk ~= nil) then
+				local Mk = RowMk[bx]
 				if (Mk ~= nil) then
 					Cr, Cg, Cb = Mk[1], Mk[2], Mk[3]
 				end
