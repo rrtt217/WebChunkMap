@@ -944,6 +944,16 @@ function W.HandleRequest(Request, UrlPath)
 		return Png, "image/png"
 	end
 
+	-- ?format=bin：把画布 payload 以 base64 文本回出去（调试 / 增量平移将来要用）。
+	-- 注意 WebAdmin 会把返回内容一律包进模板 HTML，插件拿不到"裸响应"，
+	-- 所以这里只能给 base64 文本而不是二进制流。
+	if ((Param(Request, "format") or "html") == "bin") then
+		if (Bin == nil) then
+			return "<p>画布数据还在后台渲染，请稍候刷新。</p>", "text/html"
+		end
+		return "<pre id='wcm-b64'>" .. Base64Encode(Bin) .. "</pre>", "text/html"
+	end
+
 	-- 页面用的实际生效参数
 	local P = {
 		world = WorldName,
@@ -967,8 +977,13 @@ function W.HandleRequest(Request, UrlPath)
 
 	-- ?panel=1：只回详情面板那一段，供页面用 fetch() 局部替换（不整页重载）
 	if (Param(Request, "panel") == "1") then
+		-- 必须把 #wcm-panel 容器一起回出去：页面侧是
+		--     d.getElementById('wcm-panel').innerHTML = ...
+		-- 只回内层内容的话那边取到 null，而那段 JS 有 if(n&&e) 挡着 ——
+		-- **不报错、只是永远不更新**，症状是"点区块后详情面板不跟着变"。
 		local PanelPath = RequestPath(Request)
-		return BuildSelectionPanel(PanelPath, PanelPath .. "?", P, WInfo, SelList), "text/html"
+		return "<div id='wcm-panel'>" .. BuildSelectionPanel(PanelPath, PanelPath .. "?", P, WInfo, SelList) .. "</div>",
+			"text/html"
 	end
 
 	return BuildPage(Request, P, WInfo, Meta, Png, Bin, Notice, RefreshDelay, InfoStale, QueuedRender), "text/html"
