@@ -61,7 +61,9 @@ local function ReadSettings(Folder)
 		PngFilter     = Ini:GetValueSet("Render", "PngFilter", "none"),
 		ShadeDownsample = Ini:GetValueSetI("Render", "ShadeDownsample", 2),
 		CanvasPayload = Ini:GetValueSetI("Render", "CanvasPayload", 1),
-		CanvasOnly = Ini:GetValueSetI("Render", "CanvasOnly", 0),
+		-- 默认 1：页面默认就走画布（UseCanvas 默认也是 1），此时再出 PNG 纯属白烧 260 ms。
+		-- 浏览器不支持 canvas 时页面会给 ?canvas=0 的回退链接，那条路会强制出 PNG。
+		CanvasOnly = Ini:GetValueSetI("Render", "CanvasOnly", 1),
 		UseCanvas = Ini:GetValueSetI("Web", "UseCanvas", 1),
 		PluginFolder = Folder,
 
