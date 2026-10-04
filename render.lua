@@ -26,6 +26,7 @@ R.Config = {
 	DrawSpawn = true,
 	DrawStructures = true,    -- 在地图上标出结构位置（跨插件调用 VanillaFeatureComplement 的 Locate API）
 	PngFactor = 6,
+	PngFilter = "none",
 
 	RememberTiles = true,     -- 是否记住曾经加载过的区块
 	RememberedShade = 1.0,    -- 记忆中的区块的压暗系数（1.0 = 与实时一致）
@@ -1121,7 +1122,7 @@ function R.Render(World, Opts)
 	end
 
 	local Pixels = concat(Out)
-	local Png = WCM_Png.Encode(ImgSize, ImgSize, Pixels, Cfg.PngFactor)
+	local Png = WCM_Png.Encode(ImgSize, ImgSize, Pixels, Cfg.PngFactor, Cfg.PngFilter)
 
 	local Meta = {
 		WorldName = WorldName,

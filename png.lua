@@ -97,15 +97,26 @@ local function Chunk(Type, Data)
 	return U32(#Data) .. Type .. Data .. U32(Crc32(Type .. Data))
 end
 
---- 把一行原始像素做 Sub 滤波（PNG filter type 1），对成片同色区域压缩率提升明显。
--- 每批用一个 string.char(unpack(...)) 产出字符串，而不是每字节一个 char()。
--- 1000x1000 的图有 300 万个字节：原来会造出 300 万个**可回收对象**
---（每字节一个单字符字符串 + 一个表项），这是实打实的 GC 压力。
--- 改成数字缓冲后表里放的是数字（数字不进 GC），字符串只在每批边界产生一次。
--- 上限 2048 是为了不撞 Lua 的 unpack 参数上限（C 栈，通常 8000）。
+--- 行滤波。实测地图数据下 "none" **又更快又更小**，所以默认它。
+---
+--- A/B 实测（48x48 视野 = 768x768 的真实地图，本机）：
+---     sub  : PNG 266.5 KiB，渲染 747 ms
+---     none : PNG 217.5 KiB，渲染 556 ms
+--- 也就是说不滤波快 26%、小 18%。原因：地图是大片同色（海、平原），zlib 的 LZ77
+--- 本来就能把这些长重复串压得很好；Sub 把成片同色变成 0 确实也压得动，但每个色块
+--- 边界的差值是高熵数据，得不偿失。**PNG 的 Sub 是为照片那种渐变设计的，不适合色块图。**
+---（合成数据上差距更大：Sub 16.0 KiB / none 9.0 KiB —— Sub 流里 93.7% 是 0 字节，
+---  反而压得比未滤波的更差。）
+--- 另外 Sub 是逐字节纯 Lua 运算，1.7 MB 要花约 250 ms；而 ZLIB 是原生 C++，只占 3 ms。
+--- 所以真正值钱的是"别做这件事"，而不是"换个更快的库"。
+--- 留着 "sub" 是为了万一有人用完全不同的地形还想对比。
 local SUBFILTER_BATCH = 2048
 
-local function SubFilter(Row)
+local function FilterNone(Row)
+	return "\0" .. Row
+end
+
+local function FilterSub(Row)
 	local Out = {}
 	local Buf, Bn = {}, 0
 	for i = 1, #Row do
@@ -127,21 +138,29 @@ local function SubFilter(Row)
 	return "\1" .. table.concat(Out)
 end
 
+local FILTERS = {
+	none = FilterNone,
+	sub  = FilterSub,
+}
+
 --- 把 RGB 原始像素编码成 PNG。
 -- @param Width, Height 图片尺寸
 -- @param Pixels Width*Height*3 字节的原始 RGB 数据（逐行排列）
 -- @param Factor ZLIB 压缩等级 0..9
 -- @return string PNG 文件内容
-function WCM_Png.Encode(Width, Height, Pixels, Factor)
+function WCM_Png.Encode(Width, Height, Pixels, Factor, FilterName)
 	EnsureTables()
 	Factor = floor(tonumber(Factor) or 6)
 	if (Factor < 0) then Factor = 0 end
 	if (Factor > 9) then Factor = 9 end
 
+	-- 不认识的滤波名一律退回 none（它既快又小，是安全的兜底）
+	local Filter = FILTERS[FilterName or "none"] or FilterNone
+
 	local Stride = Width * 3
 	local Rows = {}
 	for y = 0, Height - 1 do
-		Rows[#Rows + 1] = SubFilter(Pixels:sub(y * Stride + 1, y * Stride + Stride))
+		Rows[#Rows + 1] = Filter(Pixels:sub(y * Stride + 1, y * Stride + Stride))
 	end
 	local Raw = table.concat(Rows)
 
