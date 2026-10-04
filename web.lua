@@ -355,6 +355,12 @@ local PAGE_CSS = [[
 .wcm-pending { display: flex; align-items: center; justify-content: center; color: #888;
 	background: #F4F7F6; font-size: 13px; }
 .wcm-sel { position: absolute; box-sizing: border-box; border: 2px solid #c14544; pointer-events: none; }
+/* 画布模式下的标记：DOM 叠加层（PNG 路径仍然把标记画进像素） */
+.wcm-mk { position: absolute; box-sizing: border-box; pointer-events: none; }
+.wcm-mk-player { background: #e63c3c; border: 2px solid #fff; }
+.wcm-mk-spawn { background: #46a0ff; border: 2px solid #fff; }
+.wcm-mk-struct { background: #d8a03c; border: 2px solid #fff; }
+.wcm-mk-struct-guess { background: #d8a03c; border: 2px dashed #000; }
 .wcm-sw { display: inline-block; width: 11px; height: 11px; border: 1px solid #999; margin: 0 4px -1px 8px; }
 .wcm-actions button { margin-right: 4px; }
 </style>
@@ -544,6 +550,34 @@ local function BuildPage(Request, P, WInfo, Meta, Png, Bin, Notice, RefreshDelay
 	else
 		A("<div class='wcm-pending' style='width:" .. Meta.Width .. "px;height:" .. Meta.Height .. "px'>"
 			.. "正在后台渲染…</div>")
+	end
+
+	-- 画布模式下的标记：改成 DOM 叠加层 —— 比画进像素更清晰、与缩放无关、还能带 tooltip。
+	-- PNG 路径仍然把标记画进像素，所以这里**只在画布模式输出**，免得出现两份。
+	if UseCanvas then
+		local function Spot(BlockX, BlockZ, Px, Cls, Title)
+			local sx = (BlockX - Meta.OriginX) * Meta.Scale
+			local sz = (BlockZ - Meta.OriginZ) * Meta.Scale
+			local Shift = floor(Px / 2)
+			A("<span class='wcm-mk " .. Cls .. "' title='" .. Esc(Title) .. "' style='left:" .. (sx - Shift)
+				.. "px;top:" .. (sz - Shift) .. "px;width:" .. Px .. "px;height:" .. Px .. "px'></span>")
+		end
+		local MkPx = Meta.Scale * 3
+		for _, S in ipairs(Meta.PlayerSpots or {}) do
+			if (S.Kind == "player") then
+				Spot(S.X, S.Z, MkPx, "wcm-mk-player", (S.Name or "玩家") .. " 在这里")
+			else
+				Spot(S.X, S.Z, MkPx, "wcm-mk-spawn", "出生点")
+			end
+		end
+		local StPx = Meta.Scale * 5
+		for _, S in ipairs(Meta.Structures or {}) do
+			if (type(S.X) == "number") and (type(S.Z) == "number") then
+				Spot(floor(S.X), floor(S.Z), StPx,
+					"wcm-mk-struct" .. (S.Confirmed and "" or " wcm-mk-struct-guess"),
+					(S.Display or S.Kind or "结构") .. (S.Confirmed and "" or "（未确认）"))
+			end
+		end
 	end
 
 	for _, C in ipairs(SelList) do
