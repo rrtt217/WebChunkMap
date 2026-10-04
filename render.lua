@@ -27,6 +27,8 @@ R.Config = {
 	DrawStructures = true,    -- 在地图上标出结构位置（跨插件调用 VanillaFeatureComplement 的 Locate API）
 	PngFactor = 6,
 	PngFilter = "none",
+	-- 山体阴影降采样倍率：1 = 每像素都算，2 = 每两像素算一次（省一半推导开销）
+	ShadeDownsample = 2,
 
 	RememberTiles = true,     -- 是否记住曾经加载过的区块
 	RememberedShade = 1.0,    -- 记忆中的区块的压暗系数（1.0 = 与实时一致）
@@ -108,16 +110,23 @@ end
 
 R.Now = Now
 
---- 山体阴影的明暗系数查表。
---- F = 1 + (Here - There) * 0.05 被夹在 [0.62, 1.35]，而高度差是整数，
---- 所以实际只有十几二十种取值 —— 查表替掉每像素的浮点乘 + 两次比较。
---- 表覆盖高度差 -256..256（高度字节 0..255），夹取在构建时就做完了。
-local ShadeF = {}
-for D = -256, 256 do
-	local F = 1 + D * 0.05
+--- 山体阴影的"颜色级"查表 —— 每像素省掉 3 次 math.floor（那是 C 调用）。
+---
+--- 明暗系数 F 被夹在 [0.62, 1.35]，高度差又是整数，所以按 F 的**实际取值**
+--- 只有 DC in -8..8 这 17 种。于是可以先把 floor(通道值 * F) 全算好：
+---     Cr = floor(Cr * F)   -->   Cr = ShadeTab[DC + 8][Cr]
+--- 把 "3 次 C 调用 + 3 次浮点乘" 换成 "3 次表索引"。
+--- 这是**逐字节等价**的改写（表里存的就是 floor(c * F) 的原值，不是近似）。
+local ShadeTab = {}
+for DC = -8, 8 do
+	local F = 1 + DC * 0.05
 	if (F > 1.35) then F = 1.35 end
 	if (F < 0.62) then F = 0.62 end
-	ShadeF[D + 256] = F
+	local T = {}
+	for c = 0, 255 do
+		T[c] = floor(c * F)
+	end
+	ShadeTab[DC + 8] = T
 end
 
 local function Clock()
@@ -1030,6 +1039,9 @@ function R.Render(World, Opts)
 	local IsChunks = (Mode == "chunks")
 	local DrawGrid = Cfg.DrawChunkGrid and true or false
 	local Shading = Cfg.HillShading and (Mode == "topo") and true or false
+	-- 阴影降采样倍率（见 [Render] ShadeDownsample 的说明与实测数据）
+	local Downsample = floor(tonumber(Cfg.ShadeDownsample) or 1)
+	if (Downsample < 1) then Downsample = 1 end
 
 	-- 山体阴影要读"上一像素行"的高度，所以每行保留一份"每区块 16 字节"的高度带，
 	-- 两行轮换使用。这样阴影不用每像素去查 TileGrid、也不做除法。
@@ -1065,6 +1077,8 @@ function R.Render(World, Opts)
 		local RowChunkBase = RowChunk * SizeChunks
 		local Row, Buf, Bn = {}, {}, 0
 		local RowMk = (RowsMk ~= nil) and RowsMk[bz] or nil
+		-- 山体阴影的降采样状态（每行重置）：见下面阴影段的说明
+		local ShadeReuse, CurShade = 0, nil
 		PrevRow, CurRow = CurRow, PrevRow
 
 		-- bx/16 与 bx%16 用递增计数器代替（原来是每像素两次除法 + 两次取模）；
@@ -1122,7 +1136,18 @@ function R.Render(World, Opts)
 					-- 既不查 TileGrid 也不做除法；明暗系数查表。
 					-- 注意 PrevRow 里可能没有这一格（那个区块当时没有快照）——
 					-- 对应老代码里 nt == nil 的情况，跳过即可。
-					if Shading and (bx > 0) and (bz > 0) and (State ~= 0) then
+					-- 山体阴影。
+					--
+					-- 降采样：阴影是低频场，所以**每两个像素才算一次明暗系数**，中间那个
+					-- 直接复用。误差只是"阴影边界横移一个方块"，肉眼看不出来，
+					-- 省下的是每像素两次字符串取字节 + 比较 + 夹取（那才是这里的大头，
+					-- 因为 Lua 里字符串取字节是 C 调用）。
+					--
+					-- 只在真正算过之后才设复用计数：bx == 0（左边越界）不算，
+					-- 于是下个像素会自己算，不会把"无阴影"错误地传播出去。
+					if (ShadeReuse > 0) then
+						ShadeReuse = ShadeReuse - 1
+					elseif Shading and (bx > 0) and (bz > 0) and (State ~= 0) then
 						local There
 						if (tx > 0) then
 							local PB = PrevRow[cx + 1]
@@ -1132,12 +1157,21 @@ function R.Render(World, Opts)
 							There = (PB ~= nil) and PB:byte(16) or nil
 						end
 						local Here = CurBand:byte(tx + 1)
+						CurShade = nil
 						if (Here ~= nil) and (There ~= nil) and (Here > 0) and (There > 0) then
-							local F = ShadeF[Here - There + 256]
-							Cr = floor(Cr * F)
-							Cg = floor(Cg * F)
-							Cb = floor(Cb * F)
+							local D = Here - There
+							-- D == 0 时 F 恰好是 1 —— 平坦地形（海、平原）走这条捷径
+							if (D ~= 0) then
+								if (D > 8) then D = 8 elseif (D < -8) then D = -8 end
+								CurShade = ShadeTab[D + 8]
+							end
 						end
+						ShadeReuse = Downsample - 1
+					end
+					if (CurShade ~= nil) then
+						Cr = CurShade[Cr]
+						Cg = CurShade[Cg]
+						Cb = CurShade[Cb]
 					end
 
 					if (State == 1) and (Shade ~= 1) then

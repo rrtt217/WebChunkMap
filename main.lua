@@ -59,6 +59,7 @@ local function ReadSettings(Folder)
 		DrawStructures = Ini:GetValueSetB("Render", "DrawStructures", true),
 		PngFactor     = Ini:GetValueSetI("Render", "PngCompression", 6),
 		PngFilter     = Ini:GetValueSet("Render", "PngFilter", "none"),
+		ShadeDownsample = Ini:GetValueSetI("Render", "ShadeDownsample", 2),
 
 		RememberTiles    = Ini:GetValueSetB("Cache", "RememberChunks", true),
 		RememberedShade  = Ini:GetValueSetF("Cache", "RememberedShade", 1.0),
@@ -264,6 +265,7 @@ function Initialize(Plugin)
 		DrawStructures = Cfg.DrawStructures,
 		PngFactor = Cfg.PngFactor,
 		PngFilter = Cfg.PngFilter,
+		ShadeDownsample = Cfg.ShadeDownsample,
 		RememberTiles = Cfg.RememberTiles,
 		RememberedShade = Cfg.RememberedShade,
 		MaxTiles = Cfg.MaxTiles,
